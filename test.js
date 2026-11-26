@@ -33,6 +33,8 @@ Module._load = function(request, parent, isMain) {
 const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pred-api-v3-test-'));
 process.env.DATA_DIR = testDataDir;
 const api = require('./server');
+// Tests simulate successive source polls, so each one must bypass the short result cache.
+const poll = gameId => { delete api._state.recentOk[gameId]; return api.runPredict(gameId); };
 
 after(() => {
   Module._load = originalLoad;
@@ -196,7 +198,7 @@ test('Compact history row contains only session, actual result and verdict icon'
     actual_dice: null, actual_sum: null, ok: true
   }, api.GAMES['lc79/xocdia']);
   assert.deepEqual(xocdia, {
-    phien: 2991, ket_qua: '3 đỏ - 1 trắng', icon: '✅'
+    phien: 2991, ket_qua: '3 đỏ - 1 trắng', chan_le: 'Lẻ', icon: '✅'
   });
   const pending = api.formatCompactHistoryRow({ phien: '2993', actual: null, ok: null }, api.GAMES['lc79/tx']);
   assert.equal(pending, null);
@@ -369,7 +371,7 @@ test('Live Xoc Dia JSON is fully Vietnamese and does not expose dice or total fi
     { id: 102, dices: ['trắng', 'trắng', 'trắng', 'trắng'] },
     { id: 101, dices: ['đỏ', 'đỏ', 'đỏ', 'đỏ'] }
   ] };
-  const result = await api.runPredict('lc79/xocdia');
+  const result = await poll('lc79/xocdia');
   assert.equal(Object.hasOwn(result, 'Xuc_xac'), false);
   assert.equal(Object.hasOwn(result, 'Tong'), false);
   assert.equal(result.Ket_qua, '2 đỏ - 2 trắng');
@@ -404,7 +406,7 @@ test('A game with fewer than five source sessions remains in warm-up and emits n
       Tong: session % 2 ? 9 : 6,
       Ket_qua: session % 2 ? 'Xỉu' : 'Xỉu'
     };
-    result = await api.runPredict('max789/kubet');
+    result = await poll('max789/kubet');
     assert.equal(result.Trang_thai, 'DANG_HOC_DU_LIEU');
     assert.equal(result.Sample_size, session - 100);
     assert.equal(result.Du_doan, null);
@@ -421,7 +423,7 @@ test('A game starts forecasting only after the fifth distinct valid session is s
   axiosState.data = {
     Phien: 105, Phien_tiep: 106, Xuc_xac: '4 - 4 - 5', Tong: 13, Ket_qua: 'Tài'
   };
-  const result = await api.runPredict('max789/kubet');
+  const result = await poll('max789/kubet');
   assert.equal(result.Trang_thai, 'DA_SAN_SANG');
   assert.equal(result.Is_ready, true);
   assert.equal(result.Sample_size, 5);
@@ -443,7 +445,7 @@ test('Three consecutive settled misses trigger one protected skipped session, th
     { Phien: 301, Xuc_xac_1: 5, Xuc_xac_2: 4, Xuc_xac_3: 3, Tong: 12, Ket_qua: 'Tài' },
     { Phien: 300, Xuc_xac_1: 1, Xuc_xac_2: 3, Xuc_xac_3: 4, Tong: 8, Ket_qua: 'Xỉu' }
   ];
-  const paused = await api.runPredict('betvip/tx');
+  const paused = await poll('betvip/tx');
   assert.equal(paused.Trang_thai, 'TAM_DUNG_BAO_VE');
   assert.equal(paused.Du_doan, null);
   assert.equal(paused.Consecutive_losses, 3);
@@ -457,7 +459,7 @@ test('Three consecutive settled misses trigger one protected skipped session, th
     { Phien: 301, Xuc_xac_1: 5, Xuc_xac_2: 4, Xuc_xac_3: 3, Tong: 12, Ket_qua: 'Tài' },
     { Phien: 300, Xuc_xac_1: 1, Xuc_xac_2: 3, Xuc_xac_3: 4, Tong: 8, Ket_qua: 'Xỉu' }
   ];
-  const resumed = await api.runPredict('betvip/tx');
+  const resumed = await poll('betvip/tx');
   assert.equal(resumed.Trang_thai, 'DA_SAN_SANG');
   assert.ok(['Tài', 'Xỉu'].includes(resumed.Du_doan));
   assert.equal(resumed.Phien_tiep, 306);
@@ -471,4 +473,138 @@ test('Risk-pause history is labeled separately and is not counted as a loss', ()
     { phien: '886', du_doan: 'Tài', pred_side: 'T', ok: false }
   ];
   assert.equal(api.consecutiveLossState('max789/kubet').count, 0);
+});
+
+/* ===================== Regression tests for audit fixes ===================== */
+
+test('Xoc Dia reason text uses Chẵn/Lẻ and never Tài/Xỉu', () => {
+  const pattern = [1, 3, 1, 1, 3, 1, 3, 1, 1, 1, 3, 1, 3, 3, 1, 1, 1, 3, 1, 3];
+  const rows = pattern.map((red, i) => ({
+    session: String(9000 - i), side: red % 2 === 0 ? 'CHAN' : 'LE',
+    sideSource: 'derived_color', doCount: red, vi: api.formatXocdia(red),
+    dice: [], sum: null, time: null
+  }));
+  const engine = new api.Engine('lc79/xocdia', 'xocdia');
+  engine.loadHistory(rows);
+  const result = engine.predict();
+  assert.equal(result.ready, undefined, 'engine should be ready with 20 samples');
+  assert.ok(['Chẵn', 'Lẻ'].includes(result.label));
+  assert.doesNotMatch(result.lyDo, /Tài|Xỉu|xúc|tổng/i);
+  assert.match(result.lyDo, /Chẵn|Lẻ/);
+});
+
+test('Protected-skip session stays in /history with its real result and no win/loss', () => {
+  const gameId = 'lc79/xocdia';
+  const game = api.GAMES[gameId];
+  const src = (session, red) => ({
+    session, side: red % 2 === 0 ? 'CHAN' : 'LE', sideSource: 'derived_color',
+    doCount: red, vi: api.formatXocdia(red), dataWarning: null, dice: [], sum: null, time: null
+  });
+  // Newest first, as the source returns it.
+  const rows = [src('8128126', 1), src('8128125', 2), src('8128124', 3)];
+  api._state.sourceCache[gameId] = rows;
+  api._state.predHistory[gameId] = [
+    { phien: '8128126', du_doan: 'Lẻ', pred_side: 'LE', conf: 55, ok: null, void: false },
+    { phien: '8128125', du_doan: 'Tạm dừng bảo vệ', pred_side: null, conf: null, risk_pause: true, ok: null },
+    { phien: '8128124', du_doan: 'Chẵn', pred_side: 'CHAN', conf: 52, ok: null, void: false }
+  ];
+  api.settlePredictionLogs(gameId, rows);
+  const history = api.buildGameHistory(gameId, game);
+  assert.deepEqual(history.map(row => row.phien), [8128126, 8128125, 8128124],
+    'skipped session 8128125 must not disappear from history');
+  const skipped = history.find(row => row.phien === 8128125);
+  assert.equal(skipped.chan_le, 'Chẵn');
+  assert.equal(skipped.icon, '⏸️');
+  // Stats must not count the protected skip as a loss.
+  const stats = api.getGamePredictionStats(gameId);
+  assert.equal(stats.sai + stats.dung, 2);
+  assert.equal(stats.tam_dung, 1);
+});
+
+test('/history also lists source sessions that were never logged as forecasts', () => {
+  const gameId = 'lc79/xocdia';
+  const game = api.GAMES[gameId];
+  const src = (session, red) => ({
+    session, side: red % 2 === 0 ? 'CHAN' : 'LE', sideSource: 'derived_color',
+    doCount: red, vi: api.formatXocdia(red), dataWarning: null, dice: [], sum: null, time: null
+  });
+  const rows = [src('700', 3), src('699', 2)];
+  api._state.sourceCache[gameId] = rows;
+  api._state.predHistory[gameId] = [];
+  const history = api.buildGameHistory(gameId, game);
+  assert.deepEqual(history.map(row => row.phien), [700, 699]);
+  assert.equal(history[0].ket_qua, '3 đỏ - 1 trắng');
+  assert.equal(history[0].icon, '➖', 'no forecast recorded: neutral icon, never a fake verdict');
+});
+
+test('A three-dice triple shows Bộ ba instead of null Ket_qua', async () => {
+  axiosState.data = { list: [{ session: 5000, Xuc_xac: '1 - 1 - 1', Ket_qua: null }] };
+  const result = await poll('betvip/tx');
+  assert.equal(result.Ket_qua, 'Bộ ba');
+  assert.equal(result.Xuc_xac, '1 - 1 - 1');
+});
+
+test('Corrupt source file is backed up before a new write can overwrite it', () => {
+  const gameId = 'lc79/md5';
+  const file = path.join(testDataDir, `source_${gameId.replace('/', '_')}.json`);
+  fs.writeFileSync(file, '[{"session":"1","side":"T"', 'utf8'); // truncated JSON
+  const merged = api.mergeSourceHistory(gameId, [{ session: '2', side: 'X', sideSource: 'dice_sum', dice: [1, 2, 3], sum: 6 }]);
+  assert.equal(merged.length, 1);
+  const backups = fs.readdirSync(testDataDir).filter(name => name.startsWith(`source_${gameId.replace('/', '_')}.json.corrupt-`));
+  assert.equal(backups.length, 1, 'the corrupted file must be preserved as a .corrupt- backup');
+  assert.match(fs.readFileSync(path.join(testDataDir, backups[0]), 'utf8'), /"session":"1"/);
+});
+
+test('Embedded cầu rows never stamp synthetic:true onto a real session', () => {
+  const gameId = 'hitclub/md5';
+  api.mergeSourceHistory(gameId, [{ session: '500', side: 'T', sideSource: 'dice_sum', dice: [4, 5, 6], sum: 15 }]);
+  api.mergeSourceHistory(gameId, [
+    { session: '499', side: 'X', sideSource: 'embedded_cau', synthetic: true, dice: [], sum: null, time: null },
+    { session: '500', side: 'X', sideSource: 'embedded_cau', synthetic: true, dice: [], sum: null, time: null }
+  ]);
+  const file = path.join(testDataDir, 'source_hitclub_md5.json');
+  const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const real = stored.find(row => row.session === '500');
+  assert.equal(real.side, 'T', 'a weaker embedded label must not override the real outcome');
+  assert.equal(real.sideSource, 'dice_sum');
+  assert.notEqual(real.synthetic, true, 'real session must not be flagged synthetic');
+  const hidden = stored.find(row => row.session === '499');
+  assert.equal(hidden.synthetic, true, 'purely embedded session keeps its synthetic flag');
+});
+
+test('Fresh source result is reused briefly so bursts of requests do not each hit the source', async () => {
+  const gameId = 'hitclub/tx';
+  delete api._state.recentOk[gameId];
+  axiosState.data = { list: [{ session: 7000, Xuc_xac: '2 - 3 - 4', Ket_qua: 'Tài' }] };
+  const first = await api.runPredict(gameId);
+  axiosState.data = { list: [{ session: 7001, Xuc_xac: '5 - 5 - 6', Ket_qua: 'Tài' }] };
+  const second = await api.runPredict(gameId);
+  assert.equal(second, first, 'second call inside the cache window returns the same payload');
+  delete api._state.recentOk[gameId];
+  const third = await api.runPredict(gameId);
+  assert.equal(third.Phien, 7001, 'after the window the source is read again');
+});
+
+test('Engine no longer fabricates a forecast when history is insufficient', () => {
+  const engine = new api.Engine('betvip/tx', 'tx');
+  engine.loadHistory([]);
+  const result = engine.predict();
+  assert.equal(result.ready, false);
+  assert.equal(result.side, undefined);
+  assert.equal(result.label, undefined);
+});
+
+test('Capital Vietnamese colour Đỏ is recognised (Xóc Đĩa sides are not dropped)', () => {
+  const rows = api.parseLc79Xocdia({ list: [
+    { session: 11, dices: ['Đỏ', 'Trắng', 'Đỏ', 'Trắng'] },
+    { session: 12, dices: ['đỏ', 'trắng', 'trắng', 'trắng'] },
+    { session: 13, dices: ['Trắng', 'Trắng', 'Trắng', 'Trắng'] }
+  ] });
+  const bySession = Object.fromEntries(rows.map(row => [row.session, row]));
+  assert.equal(bySession['11'].doCount, 2);
+  assert.equal(bySession['11'].side, 'CHAN');
+  assert.equal(bySession['12'].doCount, 1);
+  assert.equal(bySession['12'].side, 'LE');
+  assert.equal(bySession['13'].doCount, 0);
+  assert.equal(bySession['13'].side, 'CHAN');
 });
