@@ -93,13 +93,19 @@ const GAMES = {
 
 /* ================================ STORAGE ================================ */
 function loadJSON(file, fallback) {
+  const full = path.join(DATA_DIR, file);
   try {
-    const full = path.join(DATA_DIR, file);
     if (!fs.existsSync(full)) return fallback;
     const value = JSON.parse(fs.readFileSync(full, 'utf8'));
     return value == null ? fallback : value;
   } catch (error) {
     console.error('[JSON-READ]', file, error.message);
+    // Không để lần ghi kế tiếp đè mất dữ liệu: giữ bản hỏng để khôi phục thủ công.
+    try {
+      if (fs.existsSync(full)) fs.renameSync(full, `${full}.corrupt-${Date.now()}`);
+    } catch (renameError) {
+      console.error('[JSON-BACKUP]', file, renameError.message);
+    }
     return fallback;
   }
 }
@@ -148,10 +154,12 @@ function makeModelProfile(name, options = {}) {
 
 /* ================================ HELPERS ================================ */
 function normText(value) {
+  // Phải thay cả "Đ" hoa trước khi chuyển thường: toLowerCase() biến "Đ" thành "đ"
+  // (không còn khớp), làm "Đỏ" thành "đo" và bị bỏ qua khi nhận diện màu.
   return String(value == null ? '' : value)
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
-    .replace(/đ/g, 'd')
+    .replace(/[Đđ]/g, 'd')
     .toLowerCase()
     .trim();
 }
@@ -523,6 +531,12 @@ function mergeSourceHistory(gameId, incomingRows) {
     const acceptOutcome = !old || incomingQuality >= oldQuality;
     for (const [field, value] of Object.entries(row)) {
       if (field === 'session' || field === '_order') continue;
+      if (field === 'synthetic') {
+        // Cờ "dữ liệu cầu nhúng" chỉ dành cho phiên chưa có bản ghi thật.
+        if (!old) merged.synthetic = value;
+        else if (incomingQuality > 0) delete merged.synthetic;
+        continue;
+      }
       if (field === 'side') {
         // Kết quả có bằng chứng mạnh hơn không bị ghi đè bởi cầu nhúng/nhãn yếu hơn.
         if (acceptOutcome && row.sideSource !== 'missing') merged.side = value;
@@ -854,14 +868,19 @@ function modelProbability(history, type, gameId = 'default') {
     .filter(row => row.key !== 'base')
     .sort((a, b) => Math.abs(b.p - 0.5) - Math.abs(a.p - 0.5))
     .slice(0, 2);
+  // Nội bộ mô hình dùng T/X. Với Xóc Đĩa T tương ứng Chẵn và X tương ứng Lẻ,
+  // nên nhãn lý do phải được đổi theo loại game, không dùng chung Tài/Xỉu.
+  const sideWord = value => type === 'xocdia'
+    ? (value === 'T' ? 'Chẵn' : 'Lẻ')
+    : (value === 'T' ? 'Tài' : 'Xỉu');
   const reasons = [];
-  if (run >= 4) reasons.push(`Đang bệt ${run} phiên ${last === 'T' ? 'Tài' : 'Xỉu'}; mô hình không mặc định đảo cầu`);
+  if (run >= 4) reasons.push(`Đang bệt ${run} phiên ${sideWord(last)}; mô hình không mặc định đảo cầu`);
   if (strongest.length && Math.abs(strongest[0].p - 0.5) >= 0.035) {
     const label = strongest[0].key === 'markov1' || strongest[0].key === 'markov2' || strongest[0].key === 'markov3'
       ? 'chuyển tiếp chuỗi' : strongest[0].key === 'dice' ? 'phân bố mặt xúc xắc' :
         strongest[0].key === 'pattern' ? 'mẫu chuỗi tương tự' :
           strongest[0].key === 'run' ? 'thống kê độ dài bệt' : 'cửa sổ lịch sử';
-    reasons.push(`${label} nghiêng ${strongest[0].p >= 0.5 ? 'Tài' : 'Xỉu'}`);
+    reasons.push(`${label} nghiêng ${sideWord(strongest[0].p >= 0.5 ? 'T' : 'X')}`);
   }
   if (confidence <= 53) reasons.push('Tín hiệu yếu, xác suất hai cửa gần cân bằng');
   if (!reasons.length) reasons.push('Tổng hợp tần suất, chuỗi chuyển tiếp và kiểm định lịch sử');
@@ -985,13 +1004,10 @@ class Engine {
     if (this.type === 'xocdia') {
       const model = modelProbability(this.history, 'xocdia', this.id);
       if (!model) {
-        const side = 'CHAN';
-        const ranked = xocdiaPatternRanking(this.history, side);
         return {
-          side, label: 'Chẵn', conf: 50,
-          vi: ranked[0].vi, topVi: ranked.map(x => x.vi),
-          lyDo: 'Chưa đủ dữ liệu lịch sử để chấm mô hình',
-          cau: this.currentCau(20), sampleSize: this.history.length
+          ready: false, sampleSize: this.validSampleCount(),
+          requiredSamples: MIN_HISTORY_SESSIONS,
+          lyDo: 'Chưa đủ dữ liệu lịch sử để chấm mô hình'
         };
       }
       const side = model.side === 'T' ? 'CHAN' : 'LE';
@@ -1009,9 +1025,9 @@ class Engine {
     const model = modelProbability(this.history, this.type, this.id);
     if (!model) {
       return {
-        side: 'T', label: 'Tài', conf: 50,
-        lyDo: 'Chưa đủ dữ liệu lịch sử để chấm mô hình',
-        cau: this.currentCau(20), sampleSize: this.history.length
+        ready: false, sampleSize: this.validSampleCount(),
+        requiredSamples: MIN_HISTORY_SESSIONS,
+        lyDo: 'Chưa đủ dữ liệu lịch sử để chấm mô hình'
       };
     }
     return {
@@ -1036,6 +1052,11 @@ const predHistory = predHistoryRaw && typeof predHistoryRaw === 'object' && !Arr
   ? predHistoryRaw : {};
 const lastStatus = {};
 const inFlight = new Map();
+// Lịch sử nguồn mới nhất (newest-first) của từng game, cập nhật sau mỗi lần tải thành công.
+const sourceCache = {};
+// Kết quả thành công gần nhất, dùng lại trong vài giây để nhiều request không gọi nguồn liên tục.
+const recentOk = {};
+const REQUEST_CACHE_MS = 4000;
 
 function getEngine(gameId) {
   if (!engines[gameId]) {
@@ -1072,10 +1093,26 @@ function settlePredictionLogs(gameId, rows) {
   let changed = false;
   for (const log of logs) {
     if (!log || log.phien == null) continue;
-    // A protected skip is not a bet and must never be settled as a win/loss.
-    if (log.risk_pause === true) continue;
     const actualRow = findSourceResult(rows, log.phien);
     if (!actualRow) continue;
+
+    if (log.risk_pause === true) {
+      // Phiên bỏ qua để bảo vệ không phải lượt cược: chỉ ghi kết quả thật của
+      // nguồn để /history không bị thiếu phiên, không tính đúng/sai.
+      if (!actualRow.side && actualRow.sideSource !== 'triple') continue;
+      const next = {
+        actual: actualRow.sideSource === 'triple' ? 'Bộ ba' : sideLabel(actualRow.side),
+        actual_side: actualRow.side || null,
+        actual_dice: actualDiceText(actualRow, game.type),
+        actual_sum: actualRow.sum == null ? null : actualRow.sum,
+        actual_vi: game.type === 'xocdia' ? actualDiceText(actualRow, game.type) : null,
+        data_warning: actualRow.dataWarning || null
+      };
+      const rowChanged = Object.keys(next).some(key => log[key] !== next[key]);
+      if (rowChanged) { changed = true; Object.assign(log, next); }
+      continue;
+    }
+
     const predictedSide = log.pred_side || getPredictionSide(log.du_doan);
 
     if (actualRow.sideSource === 'triple') {
@@ -1130,6 +1167,7 @@ function pushPredLog(gameId, entry) {
 function consecutiveLossState(gameId, ignorePendingSession = null) {
   const logs = Array.isArray(predHistory[gameId]) ? predHistory[gameId] : [];
   let count = 0;
+  let lastLossSession = null;
   for (const entry of logs) {
     if (!entry) continue;
     if (ignorePendingSession != null && String(entry.phien) === String(ignorePendingSession) &&
@@ -1139,7 +1177,7 @@ function consecutiveLossState(gameId, ignorePendingSession = null) {
     if (entry.void === true) continue;
     if (entry.ok === false) {
       count++;
-      if (count === 1) var lastLossSession = String(entry.phien);
+      if (count === 1) lastLossSession = String(entry.phien);
       continue;
     }
     // A win or an unsettled result ends the consecutive settled-loss sequence.
@@ -1238,6 +1276,7 @@ async function fetchGame(gameId) {
   const embeddedRows = expandEmbeddedCauRows(parsed);
   const rows = mergeSourceHistory(gameId, [...parsed, ...embeddedRows]);
   if (!rows.length) throw new Error('Không có lịch sử phiên sau khi chuẩn hóa');
+  sourceCache[gameId] = rows;
   return { game, rows };
 }
 
@@ -1260,7 +1299,7 @@ async function runPredictInternal(gameId) {
       : null,
     Ket_qua: game.type === 'xocdia'
       ? (latest.vi || sideLabel(latest.side))
-      : sideLabel(latest.side),
+      : (latest.side ? sideLabel(latest.side) : (latest.sideSource === 'triple' ? 'Bộ ba' : null)),
     Cau_hien_tai: formatCauForApi(engine.currentCau(20), game.type),
     Phien_tiep: isNumericSession(nextSession) ? Number(nextSession) : nextSession,
     Time: nowVN(),
@@ -1390,7 +1429,13 @@ async function runPredictInternal(gameId) {
 
 function runPredict(gameId) {
   if (inFlight.has(gameId)) return inFlight.get(gameId);
+  const cached = recentOk[gameId];
+  if (cached && Date.now() - cached.at < REQUEST_CACHE_MS) return Promise.resolve(cached.payload);
   const task = runPredictInternal(gameId)
+    .then(payload => {
+      recentOk[gameId] = { at: Date.now(), payload };
+      return payload;
+    })
     .catch(error => {
       lastStatus[gameId] = { ok: false, error: error.message, time: nowVN() };
       throw error;
@@ -1464,9 +1509,20 @@ function buildOverview() {
       history: `/${id}/history`
     };
   });
+  const totals = games.reduce((acc, game) => {
+    const t = game.thong_ke || {};
+    acc.tong += Number(t.tong_phien) || 0;
+    acc.dung += Number(t.dung) || 0;
+    acc.sai += Number(t.sai) || 0;
+    acc.dang_cho += Number(t.dang_cho) || 0;
+    return acc;
+  }, { tong: 0, dung: 0, sai: 0, dang_cho: 0 });
+  const decided = totals.dung + totals.sai;
+  totals.ti_le_dung = decided ? Math.round((totals.dung / decided) * 1000) / 10 : null;
   return {
     id: IDOL, name: 'PRED-API', version: '4.0.0', time: nowVN(),
     total_games: games.length,
+    thong_ke_tong: totals,
     online: games.filter(game => game.status === 'online').length,
     learning: games.filter(game => game.status === 'learning' || game.status === 'pending').length,
     protected: games.filter(game => game.status === 'protected').length,
@@ -1496,7 +1552,7 @@ const $=id=>document.getElementById(id);const esc=s=>String(s??'').replace(/[&<>
 const statusText={online:'Đang chạy',learning:'Đang học',pending:'Chờ dữ liệu',protected:'Tạm dừng bảo vệ',error:'Lỗi API'};
 async function load(){try{const r=await fetch('/overview',{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);const d=await r.json();
 $('updated').textContent='Cập nhật: '+(d.time||'—');
-$('summary').innerHTML=[['total_games','Tổng game'],['online','Đang chạy'],['learning','Đang học'],['offline','Lỗi API']].map(([k,l])=>'<div class="metric"><div class="num">'+Number(d[k]||0)+'</div><small>'+l+'</small></div>').join('');
+const t=d.thong_ke_tong||{};const rateTxt=t.ti_le_dung==null?'—':t.ti_le_dung+'%';$('summary').innerHTML=[[d.total_games||0,'Tổng game'],[d.online||0,'Đang chạy'],[d.learning||0,'Đang học'],[d.offline||0,'Lỗi API'],[t.tong||0,'Dự đoán đã lưu'],[t.dung||0,'Đúng'],[t.sai||0,'Sai'],[rateTxt,'Tỉ lệ đúng']].map(([v,l])=>'<div class=\"metric\"><div class=\"num\">'+esc(v)+'</div><small>'+l+'</small></div>').join('');
 $('games').innerHTML=(d.games||[]).map(g=>{const s=g.thong_ke||{};const n=Math.max(0,Math.min(100,100*Number(g.sample_size||0)/Math.max(1,Number(g.required_samples||5))));return '<article class="game"><div class="ghead"><div class="gname">'+esc(g.name)+'</div><span class="status '+esc(g.status)+'">'+(statusText[g.status]||'Chưa rõ')+'</span></div><div class="progress"><div class="bar" style="width:'+n+'%"></div></div><div class="sample">Dữ liệu: '+Number(g.sample_size||0)+'/'+Number(g.required_samples||5)+' phiên hợp lệ</div><div class="stats"><div class="stat"><b class="wins">'+Number(s.dung||0)+'</b><span>Đúng</span></div><div class="stat"><b class="losses">'+Number(s.sai||0)+'</b><span>Sai</span></div><div class="stat"><b>'+Number(s.dang_cho||0)+'</b><span>Đang chờ</span></div><div class="stat"><b class="rate">'+esc(s.ti_le||'—')+'</b><span>Tỉ lệ đúng</span></div></div><nav class="links"><a href="'+esc(g.predict)+'">Xem dự đoán</a><a href="'+esc(g.history)+'">Lịch sử</a></nav>'+(g.error?'<div class="error-text">'+esc(g.error)+'</div>':'')+'</article>'}).join('')||'<div class="game muted">Chưa có game được cấu hình.</div>';
 }catch(e){$('updated').textContent='Không tải được dữ liệu';$('games').textContent='Lỗi tải tổng quan: '+e.message;}}
 load();setInterval(load,15000);
@@ -1547,10 +1603,19 @@ function formatHistoryRow(entry, game) {
   return `Phiên ${phien}${dice} | KQ: ${actual}${sum} | Dự đoán: ${prediction} | ${mark}${conf}`;
 }
 
+function historyIcon(entry) {
+  if (!entry) return '➖';
+  if (entry.prediction_missing === true || entry.void === true) return '➖';
+  if (entry.risk_pause === true) return '⏸️';
+  if (entry.ok === true) return '✅';
+  if (entry.ok === false) return '❌';
+  return '⏳';
+}
+
 function formatCompactHistoryRow(entry, game) {
-  if (!entry || entry.phien == null || entry.risk_pause === true) return null;
-  // Chỉ đưa phiên đã có kết quả thực tế vào /history; phiên dự đoán đang chờ
-  // không phải lịch sử kết quả và sẽ xuất hiện sau khi nguồn chốt phiên.
+  if (!entry || entry.phien == null) return null;
+  // Chỉ đưa phiên đã có kết quả thật vào /history; phiên dự đoán đang chờ
+  // sẽ xuất hiện sau khi nguồn chốt phiên.
   const hasActual = entry.actual != null || entry.actual_vi != null || entry.actual_dice != null;
   if (!hasActual) return null;
 
@@ -1561,7 +1626,8 @@ function formatCompactHistoryRow(entry, game) {
   const row = { phien: sessionValue };
   if (game.type === 'xocdia') {
     // Xóc Đĩa là bốn quân đỏ/trắng, không phải xúc xắc.
-    row.ket_qua = entry.actual_vi || entry.actual || '—';
+    row.ket_qua = entry.actual_vi || '—';
+    row.chan_le = entry.actual || '—';
   } else {
     const dice = String(entry.actual_dice || '').match(/[1-6]/g) || [];
     if (dice.length === 3) {
@@ -1571,8 +1637,63 @@ function formatCompactHistoryRow(entry, game) {
     }
     row.ket_qua = entry.actual || '—';
   }
-  row.icon = entry.void === true ? '➖' : entry.ok === true ? '✅' : entry.ok === false ? '❌' : '⏳';
+  row.icon = historyIcon(entry);
   return row;
+}
+
+// Dựng lịch sử từ DỮ LIỆU NGUỒN (không chỉ từ log dự đoán), để một phiên không
+// biến mất chỉ vì lần poll trước đã bỏ lỡ hoặc phiên đó bị tạm dừng bảo vệ.
+// Log dự đoán chỉ bổ sung trạng thái đúng/sai/tạm dừng cho phiên tương ứng.
+function buildGameHistory(gameId, game) {
+  const logs = Array.isArray(predHistory[gameId]) ? predHistory[gameId] : [];
+  const byPhien = new Map();
+  for (const log of logs) if (log && log.phien != null) byPhien.set(String(log.phien), log);
+
+  let source = sourceCache[gameId];
+  if (!Array.isArray(source)) {
+    const stored = loadJSON(sourceFile(gameId), []);
+    source = Array.isArray(stored) ? [...stored].reverse() : [];
+  }
+
+  const entries = new Map();
+  for (const row of source) {
+    if (!row || row.session == null) continue;
+    if (!row.side && row.sideSource !== 'triple') continue;
+    const phien = String(row.session);
+    const log = byPhien.get(phien);
+    entries.set(phien, {
+      phien,
+      actual: row.sideSource === 'triple' ? 'Bộ ba' : sideLabel(row.side),
+      actual_dice: game.type === 'xocdia'
+        ? (row.vi || (Number.isInteger(row.doCount) ? formatXocdia(row.doCount) : null))
+        : (Array.isArray(row.dice) && row.dice.length === 3 ? row.dice.join(' - ') : null),
+      actual_vi: game.type === 'xocdia'
+        ? (row.vi || (Number.isInteger(row.doCount) ? formatXocdia(row.doCount) : null))
+        : null,
+      ok: log ? log.ok : null,
+      void: log ? log.void === true : row.sideSource === 'triple',
+      risk_pause: log ? log.risk_pause === true : false,
+      prediction_missing: !log
+    });
+  }
+  // Phiên đã có log nhưng nguồn chưa còn trong bộ đệm: vẫn giữ nếu có kết quả thật.
+  for (const log of logs) {
+    const phien = String(log.phien);
+    if (entries.has(phien)) continue;
+    if (log.actual == null && log.actual_vi == null && log.actual_dice == null) continue;
+    entries.set(phien, { ...log, phien });
+  }
+
+  const ordered = Array.from(entries.values()).sort((a, b) => {
+    if (isNumericSession(a.phien) && isNumericSession(b.phien)) {
+      const aa = BigInt(a.phien), bb = BigInt(b.phien);
+      return aa > bb ? -1 : aa < bb ? 1 : 0;
+    }
+    return String(b.phien).localeCompare(String(a.phien));
+  });
+  return ordered.slice(0, PRED_LIMIT)
+    .map(entry => formatCompactHistoryRow(entry, game))
+    .filter(Boolean);
 }
 
 app.get('/:brand/:table/history', async (req, res) => {
@@ -1586,10 +1707,7 @@ app.get('/:brand/:table/history', async (req, res) => {
     // Khi API nguồn tạm lỗi, vẫn trả lịch sử đã lưu.
     console.error('[HISTORY_REFRESH]', gameId, error.message);
   }
-  const logs = (Array.isArray(predHistory[gameId]) ? predHistory[gameId] : []).slice(0, PRED_LIMIT);
-  const history = logs
-    .map(entry => formatCompactHistoryRow(entry, game))
-    .filter(Boolean);
+  const history = buildGameHistory(gameId, game);
   // /history chỉ chứa các dòng kết quả thực tế, không trả dự đoán, lý do,
   // độ tin cậy, thống kê phụ hoặc dữ liệu phân tích nội bộ.
   res.json({ history });
@@ -1633,7 +1751,7 @@ module.exports = {
   modelProbability, MODEL_PROFILES, getModelProfile,
   formatXocdia, redCountFromVi, sideLabel, sideFromSum, formatCauForApi,
   getSum, resolveTxOutcome,
-  settlePredictionLogs, pushPredLog, formatHistoryRow, formatCompactHistoryRow, fetchGame, runPredict, expandEmbeddedCauRows,
+  settlePredictionLogs, pushPredLog, formatHistoryRow, formatCompactHistoryRow, buildGameHistory, fetchGame, runPredict, expandEmbeddedCauRows,
   consecutiveLossState, getGamePredictionStats, buildOverview, DASHBOARD_HTML,
-  _state: { engines, predHistory, lastStatus }
+  _state: { engines, predHistory, lastStatus, sourceCache, recentOk }
 };
