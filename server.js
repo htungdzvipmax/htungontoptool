@@ -703,6 +703,197 @@ function diceDistributionRate(rows) {
   return high + low > 0 ? high / (high + low) : null;
 }
 
+/**
+ * Phân tích cấu trúc cầu nâng cao (bệt, đảo, cụm, chu kỳ, gãy, hỗn hợp).
+ * Dùng cho lý do, điều chỉnh confidence nhẹ và regime-aware weighting (ưu tiên LC79).
+ * Không thay đổi công thức cốt lõi của các component Markov/pattern/run hiện có.
+ */
+function entropyOfSides(sides, window = 20) {
+  const seq = sides.slice(-window);
+  if (seq.length < 4) return 1;
+  const counts = { T: 0, X: 0 };
+  for (const s of seq) counts[s] = (counts[s] || 0) + 1;
+  const n = seq.length;
+  let h = 0;
+  for (const c of Object.values(counts)) {
+    if (c > 0) {
+      const p = c / n;
+      h -= p * Math.log2(p);
+    }
+  }
+  return h; // 0 = pure, 1 = balanced
+}
+
+function switchRate(sides, window = 20) {
+  const seq = sides.slice(-window);
+  if (seq.length < 2) return 0.5;
+  let switches = 0;
+  for (let i = 1; i < seq.length; i++) if (seq[i] !== seq[i - 1]) switches++;
+  return switches / (seq.length - 1);
+}
+
+function detectCycle(sides, maxPeriod = 6) {
+  const seq = sides.slice(-Math.min(40, sides.length));
+  if (seq.length < 8) return null;
+  let best = null;
+  for (let period = 2; period <= maxPeriod; period++) {
+    if (seq.length < period * 3) continue;
+    let matches = 0;
+    let total = 0;
+    for (let i = period; i < seq.length; i++) {
+      if (seq[i] === seq[i - period]) matches++;
+      total++;
+    }
+    const score = total > 0 ? matches / total : 0;
+    // Yêu cầu độ khớp cao và ít nhất 2 chu kỳ đầy đủ gần đây
+    if (score >= 0.72 && total >= period * 2) {
+      if (!best || score > best.score || (score === best.score && period < best.period)) {
+        best = { period, score, matches, total };
+      }
+    }
+  }
+  return best;
+}
+
+function detectDaoPattern(sides) {
+  const seq = sides.slice(-16);
+  if (seq.length < 6) return null;
+  // 1-1
+  let is11 = true;
+  for (let i = 1; i < seq.length; i++) {
+    if (seq[i] === seq[i - 1]) { is11 = false; break; }
+  }
+  if (is11) return { type: 'DAO_11', length: seq.length, stability: 1 };
+
+  // 2-2
+  let is22 = true;
+  for (let i = 0; i + 1 < seq.length; i += 2) {
+    if (seq[i] !== seq[i + 1]) { is22 = false; break; }
+    if (i + 2 < seq.length && seq[i + 2] === seq[i]) { is22 = false; break; }
+  }
+  if (is22 && seq.length >= 6) return { type: 'DAO_22', length: seq.length, stability: 0.9 };
+
+  // 3-3 rough
+  let is33 = true;
+  for (let i = 0; i + 2 < seq.length; i += 3) {
+    if (seq[i] !== seq[i + 1] || seq[i] !== seq[i + 2]) { is33 = false; break; }
+    if (i + 3 < seq.length && seq[i + 3] === seq[i]) { is33 = false; break; }
+  }
+  if (is33 && seq.length >= 9) return { type: 'DAO_33', length: seq.length, stability: 0.85 };
+
+  return null;
+}
+
+function detectCumPattern(sides) {
+  // Các mẫu cụm phổ biến: 2-1, 1-2, 3-1, 1-3, 2-1-2, 1-2-1
+  const seq = sides.slice(-12);
+  if (seq.length < 5) return null;
+  const str = seq.join('');
+  const patterns = [
+    { re: /(TTX){2,}/, name: '2-1' },
+    { re: /(XXT){2,}/, name: '2-1' },
+    { re: /(TXX){2,}/, name: '1-2' },
+    { re: /(XTT){2,}/, name: '1-2' },
+    { re: /(TTTX){2,}/, name: '3-1' },
+    { re: /(XXXT){2,}/, name: '3-1' },
+    { re: /(TXXX){2,}/, name: '1-3' },
+    { re: /(XTTT){2,}/, name: '1-3' },
+    { re: /(TTXTTX)/, name: '2-1-2' },
+    { re: /(XXTXXT)/, name: '2-1-2' },
+    { re: /(TXTTXT)/, name: '1-2-1' },
+    { re: /(XTXXTX)/, name: '1-2-1' }
+  ];
+  for (const p of patterns) {
+    if (p.re.test(str)) return { type: 'CUM', name: p.name, match: str };
+  }
+  return null;
+}
+
+function analyzeCauStructure(sides) {
+  if (!sides || sides.length < 5) {
+    return {
+      regime: 'WEAK',
+      run: 0,
+      switchRate: 0.5,
+      entropy: 1,
+      cycle: null,
+      dao: null,
+      cum: null,
+      stability: 0,
+      description: 'Dữ liệu chưa đủ để nhận diện cầu'
+    };
+  }
+
+  const run = currentRun(sides);
+  const last = sides[sides.length - 1];
+  const sw = switchRate(sides, 20);
+  const ent = entropyOfSides(sides, 20);
+  const cycle = detectCycle(sides);
+  const dao = detectDaoPattern(sides);
+  const cum = detectCumPattern(sides);
+
+  let regime = 'MIXED';
+  let stability = 0.4;
+  let description = 'Cầu hỗn hợp / tín hiệu yếu';
+
+  if (run >= 5) {
+    regime = 'BET';
+    stability = Math.min(0.95, 0.55 + run * 0.06);
+    description = `Bệt ${run} phiên ${last === 'T' ? 'Tài' : 'Xỉu'}`;
+  } else if (run >= 3 && sw < 0.35) {
+    regime = 'BET';
+    stability = 0.6;
+    description = `Bệt ngắn ${run} phiên, xu hướng đang giữ`;
+  } else if (dao) {
+    regime = dao.type;
+    stability = dao.stability;
+    description = `Đảo ${dao.type.replace('DAO_', '')} ổn định (~${dao.length} phiên)`;
+  } else if (cycle && cycle.score >= 0.78) {
+    regime = 'CYCLE';
+    stability = cycle.score;
+    description = `Chu kỳ ${cycle.period} (khớp ${(cycle.score * 100).toFixed(0)}%)`;
+  } else if (cum) {
+    regime = 'CUM';
+    stability = 0.65;
+    description = `Cầu cụm dạng ${cum.name}`;
+  } else if (sw > 0.65 && ent > 0.9) {
+    regime = 'MIXED';
+    stability = 0.25;
+    description = 'Cầu hỗn hợp, tần suất đổi cửa cao';
+  } else if (sw < 0.4) {
+    regime = 'BET';
+    stability = 0.5;
+    description = 'Xu hướng bệt nhẹ / ít đảo';
+  }
+
+  // Phát hiện gãy: nếu trước đó có bệt dài hoặc đảo rõ nhưng gần đây bị phá
+  const recent = sides.slice(-8);
+  const older = sides.slice(-16, -8);
+  if (older.length >= 6) {
+    const oldRun = currentRun(older);
+    const oldSw = switchRate(older, 8);
+    if ((oldRun >= 4 || oldSw < 0.25) && sw > 0.55 && run <= 2) {
+      regime = 'GAY';
+      stability = 0.35;
+      description = 'Cầu gãy: cấu trúc cũ bị phá, đang chuyển trạng thái';
+    }
+  }
+
+  return {
+    regime,
+    run,
+    last,
+    switchRate: Math.round(sw * 1000) / 1000,
+    entropy: Math.round(ent * 1000) / 1000,
+    cycle,
+    dao,
+    cum,
+    stability: Math.round(stability * 1000) / 1000,
+    description
+  };
+}
+
+
 const DEFAULT_MODEL_WEIGHTS = {
   base: 0.15, short: 0.11, medium: 0.10, long: 0.08, ewma: 0.10,
   markov1: 0.11, markov2: 0.10, markov3: 0.07,
@@ -862,8 +1053,26 @@ function modelProbability(history, type, gameId = 'default') {
   let pT = totalWeight ? weighted / totalWeight : components.base;
   // Biên an toàn: không hiển thị độ tin cậy ảo kiểu 90–100% trên chuỗi ngẫu nhiên.
   pT = Math.max(0.37, Math.min(0.63, pT));
-  const side = pT >= 0.5 ? 'T' : 'X';
-  const confidence = Math.max(50, Math.min(63, Math.round(Math.max(pT, 1 - pT) * 100)));
+  let side = pT >= 0.5 ? 'T' : 'X';
+  let confidence = Math.max(50, Math.min(63, Math.round(Math.max(pT, 1 - pT) * 100)));
+
+  // Phân tích cấu trúc cầu nâng cao (dùng cho lý do + điều chỉnh nhẹ confidence).
+  // Chỉ điều chỉnh mạnh hơn cho LC79; MAX789 giữ hành vi gần như nguyên bản.
+  const cauInfo = analyzeCauStructure(sides);
+  const isLc79 = gameId.startsWith('lc79/');
+  const isMax789 = gameId.startsWith('max789/');
+
+  if (!isMax789 && cauInfo.regime === 'GAY') {
+    // Khi cầu vừa gãy, giảm confidence để tránh tín hiệu nhiễu.
+    confidence = Math.max(50, confidence - 3);
+  } else if (isLc79 && (cauInfo.regime === 'BET' || cauInfo.regime.startsWith('DAO_') || cauInfo.regime === 'CYCLE') && cauInfo.stability >= 0.7) {
+    // Cầu rõ và ổn định trên LC79: tăng nhẹ confidence nếu các component đồng thuận.
+    const agree = componentRows.filter(r => r.key !== 'base' && ((r.p >= 0.5 ? 'T' : 'X') === side)).length;
+    if (agree >= 4) confidence = Math.min(63, confidence + 2);
+  } else if (cauInfo.regime === 'MIXED' && cauInfo.switchRate > 0.6) {
+    confidence = Math.max(50, confidence - 2);
+  }
+
   const strongest = componentRows
     .filter(row => row.key !== 'base')
     .sort((a, b) => Math.abs(b.p - 0.5) - Math.abs(a.p - 0.5))
@@ -874,7 +1083,18 @@ function modelProbability(history, type, gameId = 'default') {
     ? (value === 'T' ? 'Chẵn' : 'Lẻ')
     : (value === 'T' ? 'Tài' : 'Xỉu');
   const reasons = [];
-  if (run >= 4) reasons.push(`Đang bệt ${run} phiên ${sideWord(last)}; mô hình không mặc định đảo cầu`);
+  // Ưu tiên mô tả cấu trúc cầu thực tế
+  if (cauInfo.regime === 'BET' && run >= 3) {
+    reasons.push(`Đang bệt ${run} phiên ${sideWord(last)}; mô hình không mặc định đảo cầu`);
+  } else if (cauInfo.regime.startsWith('DAO_')) {
+    reasons.push(cauInfo.description);
+  } else if (cauInfo.regime === 'CYCLE' && cauInfo.cycle) {
+    reasons.push(`Chu kỳ ${cauInfo.cycle.period} khớp ${(cauInfo.cycle.score * 100).toFixed(0)}%`);
+  } else if (cauInfo.regime === 'CUM') {
+    reasons.push(cauInfo.description);
+  } else if (cauInfo.regime === 'GAY') {
+    reasons.push('Cầu gãy — cấu trúc cũ bị phá, tín hiệu đang chuyển');
+  }
   if (strongest.length && Math.abs(strongest[0].p - 0.5) >= 0.035) {
     const label = strongest[0].key === 'markov1' || strongest[0].key === 'markov2' || strongest[0].key === 'markov3'
       ? 'chuyển tiếp chuỗi' : strongest[0].key === 'dice' ? 'phân bố mặt xúc xắc' :
@@ -882,15 +1102,27 @@ function modelProbability(history, type, gameId = 'default') {
           strongest[0].key === 'run' ? 'thống kê độ dài bệt' : 'cửa sổ lịch sử';
     reasons.push(`${label} nghiêng ${sideWord(strongest[0].p >= 0.5 ? 'T' : 'X')}`);
   }
-  if (confidence <= 53) reasons.push('Tín hiệu yếu, xác suất hai cửa gần cân bằng');
+  if (confidence <= 53 || cauInfo.regime === 'MIXED' || cauInfo.regime === 'WEAK') {
+    reasons.push('Tín hiệu yếu hoặc cầu hỗn hợp, xác suất hai cửa gần cân bằng');
+  }
   if (!reasons.length) reasons.push('Tổng hợp tần suất, chuỗi chuyển tiếp và kiểm định lịch sử');
 
   return {
     side, confidence, pT, n, run, profile: profile.name,
     lyDo: reasons.slice(0, 3).join(' · '),
-    cau: sides.slice(-20).map(side => side === 'T' ? 'T' : 'X').join(''),
+    cau: sides.slice(-20).map(s => s === 'T' ? 'T' : 'X').join(''),
     adaptive,
-    components: componentRows
+    components: componentRows,
+    regime: cauInfo.regime,
+    cauStructure: {
+      regime: cauInfo.regime,
+      run: cauInfo.run,
+      switchRate: cauInfo.switchRate,
+      entropy: cauInfo.entropy,
+      stability: cauInfo.stability,
+      description: cauInfo.description,
+      cycle: cauInfo.cycle ? { period: cauInfo.cycle.period, score: cauInfo.cycle.score } : null
+    }
   };
 }
 
@@ -1753,5 +1985,6 @@ module.exports = {
   getSum, resolveTxOutcome,
   settlePredictionLogs, pushPredLog, formatHistoryRow, formatCompactHistoryRow, buildGameHistory, fetchGame, runPredict, expandEmbeddedCauRows,
   consecutiveLossState, getGamePredictionStats, buildOverview, DASHBOARD_HTML,
+  analyzeCauStructure, detectCycle, detectDaoPattern, entropyOfSides, switchRate,
   _state: { engines, predHistory, lastStatus, sourceCache, recentOk }
 };
