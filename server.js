@@ -1,5 +1,5 @@
 /**
- * PRED-API v2.0 — TX / Sicbo / Xóc đĩa đa game
+ * PRED-API v4.0 — TX / Sicbo / Xóc đĩa đa game
  * Node >= 18 | Render: npm install && npm start
  *
  * Lưu ý: dữ liệu kết quả là ngẫu nhiên/được tạo bởi hệ thống game. Bộ phân tích
@@ -18,6 +18,8 @@ const PORT = Number(process.env.PORT) || 3000;
 const POLL_MS = Math.max(10000, Number(process.env.POLL_MS) || 25000);
 const SOURCE_LIMIT = Math.max(200, Number(process.env.SOURCE_LIMIT) || 1200);
 const PRED_LIMIT = Math.max(20, Number(process.env.PRED_HISTORY_LIMIT) || 50);
+// Never emit a forecast from fewer than five distinct, usable source sessions.
+const MIN_HISTORY_SESSIONS = Math.max(5, Number(process.env.MIN_HISTORY_SESSIONS) || 5);
 const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
@@ -134,6 +136,26 @@ function nowVN() {
   });
 }
 
+function makeModelProfile(name, options = {}) {
+  return {
+    name,
+    shortWindow: options.shortWindow || 12,
+    mediumWindow: options.mediumWindow || 35,
+    longWindow: options.longWindow || 80,
+    ewmaAlpha: options.ewmaAlpha || 0.10,
+    markovPriors: options.markovPriors || [8, 12, 16],
+    patternMaxOrder: options.patternMaxOrder || 6,
+    patternMinMatches: options.patternMinMatches || 2,
+    patternPrior: options.patternPrior || 7,
+    runPrior: options.runPrior || 8,
+    sumBandPrior: options.sumBandPrior || 10,
+    diceMaxReliability: options.diceMaxReliability || 0.45,
+    evalWindow: options.evalWindow || 55,
+    backtestMin: options.backtestMin || 12,
+    weights: options.weights || {}
+  };
+}
+
 /* ================================ HELPERS ================================ */
 function normText(value) {
   return String(value == null ? '' : value)
@@ -175,8 +197,17 @@ function parseKetQua(value) {
 }
 
 function sideFromSum(sum) {
-  if (!Number.isFinite(Number(sum)) || Number(sum) < 3 || Number(sum) > 18) return null;
-  return Number(sum) >= 11 ? 'T' : 'X';
+  const value = Number(sum);
+  if (!Number.isInteger(value) || value < 3 || value > 18) return null;
+  // Với luật 3 xúc xắc phổ biến, tổng 3 hoặc 18 là bộ ba, không xếp Tài/Xỉu.
+  if (value === 3 || value === 18) return null;
+  return value >= 11 ? 'T' : 'X';
+}
+
+function isTriple(dice) {
+  return Array.isArray(dice) && dice.length === 3 &&
+    dice.every(value => Number.isInteger(Number(value))) &&
+    Number(dice[0]) === Number(dice[1]) && Number(dice[1]) === Number(dice[2]);
 }
 
 function sideLabel(side) {
@@ -257,25 +288,80 @@ function getDice(row) {
   });
 }
 
-function getSum(row, dice) {
+function getReportedSum(row) {
   const raw = firstValue(row, ['sum', 'Sum', 'tong', 'Tong', 'point', 'Point', 'DiceSum', 'score', 'Score']);
   const parsed = toNumber(raw);
-  if (parsed !== null) return parsed;
-  const numbers = dice.map(toNumber).filter(n => n !== null && n >= 1 && n <= 6);
-  return numbers.length === 3 ? sumArray(numbers) : null;
+  return Number.isInteger(parsed) && parsed >= 3 && parsed <= 18 ? parsed : null;
 }
 
 function normalizeDiceNumbers(dice) {
-  return dice.map(toNumber).filter(n => n !== null && n >= 1 && n <= 6);
+  return (Array.isArray(dice) ? dice : []).map(toNumber)
+    .filter(n => n !== null && Number.isInteger(n) && n >= 1 && n <= 6);
+}
+
+function getSum(row, dice) {
+  const numbers = normalizeDiceNumbers(dice);
+  // Nếu API gửi đủ 3 mặt xúc xắc, tổng tự tính là nguồn có thể kiểm chứng nhất.
+  if (numbers.length === 3 && Array.isArray(dice) && dice.length === 3) return sumArray(numbers);
+  return getReportedSum(row);
+}
+
+function resolveTxOutcome(row, dice, sum) {
+  const declared = parseKetQua(firstValue(row, [
+    'resultTruyenThong', 'ResultTruyenThong', 'ket_qua', 'Ket_qua',
+    'result', 'Result', 'side', 'Side', 'name', 'Name'
+  ]));
+  const validDice = Array.isArray(dice) && dice.length === 3 && dice.every(n => Number.isInteger(n) && n >= 1 && n <= 6);
+  const triple = validDice ? isTriple(dice) : (sum === 3 || sum === 18);
+  const sourceSum = validDice ? sumArray(dice) : sum;
+  let side = null;
+  let sideSource = 'missing';
+  if (triple) {
+    sideSource = 'triple';
+  } else if (sourceSum !== null && sourceSum !== undefined) {
+    side = sideFromSum(sourceSum);
+    sideSource = validDice ? 'dice_sum' : 'reported_sum';
+  } else if (declared === 'T' || declared === 'X') {
+    side = declared;
+    sideSource = 'declared';
+  }
+
+  const reportedSum = getReportedSum(row);
+  const warnings = [];
+  if (validDice && reportedSum !== null && reportedSum !== sourceSum) {
+    warnings.push(`Tong API ${reportedSum} lệch tổng xúc xắc ${sourceSum}`);
+  }
+  if (declared === 'T' || declared === 'X') {
+    if (triple) warnings.push(`Ket_qua API ${sideLabel(declared)} nhưng xúc xắc là bộ ba`);
+    else if (side && declared !== side) warnings.push(`Ket_qua API ${sideLabel(declared)} lệch kết quả tính từ xúc xắc ${sideLabel(side)}`);
+  }
+  return {
+    side,
+    sideSource,
+    declaredSide: declared === 'T' || declared === 'X' ? declared : null,
+    reportedSum,
+    dataWarning: warnings.length ? warnings.join('; ') : null
+  };
 }
 
 
 function normalizeTime(value) {
   if (value === undefined || value === null || value === '') return null;
   const numeric = Number(value);
-  const date = Number.isFinite(numeric)
-    ? new Date(numeric > 0 && numeric < 100000000000 ? numeric * 1000 : numeric)
-    : new Date(value);
+  let date;
+  if (Number.isFinite(numeric)) {
+    date = new Date(numeric > 0 && numeric < 100000000000 ? numeric * 1000 : numeric);
+  } else {
+    const text = String(value).trim();
+    // MAX789 có lúc trả `HH:mm:ss DD/MM/YYYY`; diễn giải theo giờ Việt Nam.
+    const vn = text.match(/^(\d{1,2}):(\d{2}):(\d{2})\s+(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    if (vn) {
+      const [, hh, mm, ss, dd, month, year] = vn;
+      date = new Date(`${year}-${String(month).padStart(2, '0')}-${String(dd).padStart(2, '0')}T${hh.padStart(2, '0')}:${mm}:${ss}+07:00`);
+    } else {
+      date = new Date(text);
+    }
+  }
   return Number.isNaN(date.getTime()) ? null : date.toISOString();
 }
 
@@ -323,13 +409,18 @@ function parseXocdiaRow(row) {
   const rawVi = firstValue(row, ['resultVi', 'ResultVi', 'vi', 'Vi', 'result_vi', 'pattern', 'Pattern']);
   if (redCount === null) redCount = redCountFromVi(rawVi);
   const whiteCount = redCount === null ? null : 4 - redCount;
-  let side = parseKetQua(firstValue(row, [
+  const declaredSide = parseKetQua(firstValue(row, [
     'resultTruyenThong', 'ResultTruyenThong', 'ket_qua', 'Ket_qua', 'result', 'Result', 'side', 'Side'
   ]));
-  if (side !== 'CHAN' && side !== 'LE') side = redCount === null ? null : (redCount % 2 === 0 ? 'CHAN' : 'LE');
+  const derivedSide = redCount === null ? null : (redCount % 2 === 0 ? 'CHAN' : 'LE');
+  const side = derivedSide || (declaredSide === 'CHAN' || declaredSide === 'LE' ? declaredSide : null);
+  const dataWarning = derivedSide && (declaredSide === 'CHAN' || declaredSide === 'LE') && derivedSide !== declaredSide
+    ? `Kết quả API ${sideLabel(declaredSide)} lệch mẫu màu ${formatXocdia(redCount)}` : null;
   return {
     session: getSession(row),
     side,
+    sideSource: derivedSide ? 'derived_color' : side ? 'declared' : 'missing',
+    dataWarning,
     dice,
     doCount: redCount,
     trangCount: whiteCount,
@@ -339,55 +430,50 @@ function parseXocdiaRow(row) {
 }
 
 /* ================================= PARSERS ================================ */
+function parseTxRow(row, timeKeys = []) {
+  const rawDice = getDice(row);
+  const dice = normalizeDiceNumbers(rawDice);
+  const validDice = rawDice.length === 3 && dice.length === 3;
+  const sum = validDice ? sumArray(dice) : getReportedSum(row);
+  const outcome = resolveTxOutcome(row, validDice ? dice : [], sum);
+  const time = normalizeTime(firstValue(row, timeKeys.length ? timeKeys : [
+    'time', 'Time', 'createdAt', 'CreatedAt', 'timestamp', 'CreatedDate', 'createdDate'
+  ]));
+  return {
+    session: getSession(row), dice: validDice ? dice : [], sum,
+    side: outcome.side, sideSource: outcome.sideSource,
+    declaredSide: outcome.declaredSide, reportedSum: outcome.reportedSum,
+    dataWarning: outcome.dataWarning, time,
+    nextSession: firstValue(row, ['nextSession', 'next_session', 'phien_hien_tai', 'Phien_tiep']) || null,
+    cau: firstValue(row, ['Cau_hien_tai', 'cau_hien_tai', 'currentCau', 'current_cau']) || null,
+    apiSampleSize: toNumber(firstValue(row, ['Sample_size', 'sample_size', 'sampleSize']))
+  };
+}
+
 function parseSunwinSicbo(raw) {
   const list = getRows(raw && raw.data && raw.data.resultList ? raw.data.resultList : raw);
-  return list.map(row => {
-    const rawDice = getDice(row);
-    const dice = normalizeDiceNumbers(rawDice);
-    const sum = getSum(row, dice);
-    let side = parseKetQua(firstValue(row, [
-      'resultTruyenThong', 'ket_qua', 'Ket_qua', 'result', 'Result', 'side'
-    ]));
-    if (side !== 'T' && side !== 'X') side = sideFromSum(sum);
-    return {
-      session: getSession(row), dice, sum, side,
-      time: normalizeTime(firstValue(row, ['timeMilli', 'time', 'Time', 'createdAt']))
-    };
-  }).filter(row => row.session);
+  return list.map(row => parseTxRow(row, ['timeMilli', 'time', 'Time', 'createdAt']))
+    .filter(row => row.session);
 }
 
 function parseSunhot(raw) {
   const list = getRows(raw);
-  const rows = list.map(row => {
+  return list.map(row => {
     const side = parseKetQua(firstValue(row, ['ket_qua', 'Ket_qua', 'result', 'Result', 'side']));
     const session = String(firstValue(row, ['phien_truoc', 'Phien_truoc', 'session', 'phien', 'Phien', 'id']) || '');
     const nextSession = String(firstValue(row, ['phien_hien_tai', 'Phien_hien_tai', 'nextSession', 'next_session']) || '');
-    return { session, side: side === 'T' || side === 'X' ? side : null, dice: [], sum: null, nextSession: nextSession || null, time: normalizeTime(firstValue(row, ['time', 'Time', 'createdAt', 'timestamp'])) };
+    return {
+      session, side: side === 'T' || side === 'X' ? side : null,
+      sideSource: side === 'T' || side === 'X' ? 'declared' : 'missing',
+      dice: [], sum: null, nextSession: nextSession || null,
+      time: normalizeTime(firstValue(row, ['time', 'Time', 'createdAt', 'timestamp']))
+    };
   }).filter(row => row.session);
-  return rows;
 }
 
 function parseLc79List(raw) {
-  const list = getRows(raw);
-  return list.map(row => {
-    const dice = normalizeDiceNumbers(getDice(row));
-    const sum = getSum(row, dice);
-    let side = parseKetQua(firstValue(row, [
-      'resultTruyenThong', 'ResultTruyenThong', 'ket_qua', 'Ket_qua',
-      'result', 'Result', 'side', 'Side', 'name'
-    ]));
-    if (side !== 'T' && side !== 'X') {
-      const betSide = firstValue(row, ['BetSide', 'betSide', 'bet_side']);
-      if (betSide === 1 || betSide === '1' || normText(betSide) === 'tai') side = 'T';
-      else if (betSide === 0 || betSide === '0' || normText(betSide) === 'xiu') side = 'X';
-    }
-    if (side !== 'T' && side !== 'X') side = sideFromSum(sum);
-    return {
-      session: getSession(row), dice, sum, side,
-      time: normalizeTime(firstValue(row, ['time', 'Time', 'createdAt', 'CreatedAt', 'timestamp'])),
-      nextSession: firstValue(row, ['nextSession', 'next_session', 'phien_hien_tai']) || null
-    };
-  }).filter(row => row.session);
+  return getRows(raw).map(row => parseTxRow(row))
+    .filter(row => row.session);
 }
 
 function parseLc79Xocdia(raw) {
@@ -395,36 +481,13 @@ function parseLc79Xocdia(raw) {
 }
 
 function parseMax789(raw) {
-  return getRows(raw).map(row => {
-    const dice = normalizeDiceNumbers(getDice(row));
-    const sum = getSum(row, dice);
-    let side = parseKetQua(firstValue(row, ['result', 'Result', 'ket_qua', 'Ket_qua', 'side', 'Side']));
-    if (side !== 'T' && side !== 'X') {
-      const betSide = firstValue(row, ['BetSide', 'betSide']);
-      if ((betSide === 1 || betSide === '1') && sum !== null) side = 'T';
-      else if ((betSide === 0 || betSide === '0') && sum !== null) side = 'X';
-    }
-    if (side !== 'T' && side !== 'X') side = sideFromSum(sum);
-    return {
-      session: getSession(row), dice, sum, side,
-      time: normalizeTime(firstValue(row, ['CreatedDate', 'createdDate', 'time', 'Time']))
-    };
-  }).filter(row => row.session);
+  return getRows(raw).map(row => parseTxRow(row, ['CreatedDate', 'createdDate', 'time', 'Time']))
+    .filter(row => row.session);
 }
 
 function parseHitclub(raw) {
-  return getRows(raw).map(row => {
-    const dice = normalizeDiceNumbers(getDice(row));
-    const sum = getSum(row, dice);
-    let side = parseKetQua(firstValue(row, [
-      'ket_qua', 'Ket_qua', 'result', 'Result', 'name', 'Name', 'side', 'Side'
-    ]));
-    if (side !== 'T' && side !== 'X') side = sideFromSum(sum);
-    return {
-      session: getSession(row), dice, sum, side,
-      time: normalizeTime(firstValue(row, ['time', 'Time', 'createdAt', 'CreatedAt']))
-    };
-  }).filter(row => row.session);
+  return getRows(raw).map(row => parseTxRow(row, ['time', 'Time', 'createdAt', 'CreatedAt']))
+    .filter(row => row.session);
 }
 
 const PARSERS = {
@@ -441,6 +504,20 @@ const PARSERS = {
 // endpoint history của người dùng. Mỗi game tự học trên dữ liệu nguồn của mình.
 function sourceFile(gameId) {
   return `source_${safeFilePart(gameId)}.json`;
+}
+
+function sourceSideQuality(row) {
+  if (!row) return 0;
+  const source = row.sideSource;
+  if (source === 'dice_sum' || source === 'derived_color' || source === 'triple') return 3;
+  if (source === 'reported_sum') return 2;
+  if (source === 'declared') return 1;
+  if (source === 'embedded_cau' || source === 'missing') return 0;
+  // Compatibility with source files saved by v1/v2 before sideSource was stored.
+  if (Array.isArray(row.dice) && (row.dice.length === 3 || row.dice.length === 4)) return 3;
+  if ((row.sum !== null && row.sum !== undefined && Number.isFinite(Number(row.sum))) ||
+      (row.doCount !== null && row.doCount !== undefined && Number.isFinite(Number(row.doCount)))) return 2;
+  return row.side ? 1 : 0;
 }
 
 function compareSourceRows(a, b) {
@@ -473,7 +550,30 @@ function mergeSourceHistory(gameId, incomingRows) {
     if (!row || !row.session) continue;
     const key = String(row.session);
     const old = map.get(key);
-    const merged = { ...(old || {}), ...row, session: key };
+    const merged = { ...(old || {}), session: key };
+    const incomingQuality = sourceSideQuality(row);
+    const oldQuality = sourceSideQuality(old);
+    const acceptOutcome = !old || incomingQuality >= oldQuality;
+    for (const [field, value] of Object.entries(row)) {
+      if (field === 'session' || field === '_order') continue;
+      if (field === 'side') {
+        // Kết quả có bằng chứng mạnh hơn không bị ghi đè bởi cầu nhúng/nhãn yếu hơn.
+        if (acceptOutcome && row.sideSource !== 'missing') merged.side = value;
+        continue;
+      }
+      if (field === 'dataWarning') {
+        if (acceptOutcome && row.sideSource && row.sideSource !== 'missing' && row.sideSource !== 'embedded_cau') {
+          merged.dataWarning = value || null;
+        }
+        continue;
+      }
+      if (field === 'sideSource' && !acceptOutcome) continue;
+      if (value === null || value === undefined || value === '') {
+        if (old && old[field] !== undefined && old[field] !== null && old[field] !== '') continue;
+      }
+      if (Array.isArray(value) && value.length === 0 && old && Array.isArray(old[field]) && old[field].length) continue;
+      merged[field] = value;
+    }
     if (old && old._order) merged._order = old._order;
     else merged._order = ++order;
     map.set(key, merged);
@@ -527,8 +627,8 @@ function markovRate(sides, order, base, prior) {
   return (countT + base * prior) / (count + prior);
 }
 
-function patternRate(sides, base) {
-  for (let order = Math.min(6, sides.length - 1); order >= 2; order--) {
+function patternRate(sides, base, profile) {
+  for (let order = Math.min(profile.patternMaxOrder, sides.length - 1); order >= 2; order--) {
     const context = sides.slice(-order);
     let count = 0;
     let countT = 0;
@@ -542,12 +642,14 @@ function patternRate(sides, base) {
         if (sides[i + order] === 'T') countT++;
       }
     }
-    if (count >= 2) return (countT + base * 7) / (count + 7);
+    if (count >= profile.patternMinMatches) {
+      return (countT + base * profile.patternPrior) / (count + profile.patternPrior);
+    }
   }
   return base;
 }
 
-function runRate(sides, base) {
+function runRate(sides, base, profile) {
   if (!sides.length) return base;
   const lastSide = sides[sides.length - 1];
   const wanted = Math.min(7, currentRun(sides));
@@ -564,7 +666,7 @@ function runRate(sides, base) {
       if (sides[i + 1] === 'T') countT++;
     }
   }
-  return (countT + base * 8) / (count + 8);
+  return (countT + base * profile.runPrior) / (count + profile.runPrior);
 }
 
 function sumBand(sum) {
@@ -575,7 +677,7 @@ function sumBand(sum) {
   return 'high';
 }
 
-function sumBandRate(rows, binaryRows, base) {
+function sumBandRate(rows, binaryRows, base, profile) {
   const latest = rows[rows.length - 1];
   const bucket = latest ? sumBand(latest.sum) : null;
   if (!bucket) return base;
@@ -586,7 +688,7 @@ function sumBandRate(rows, binaryRows, base) {
     count++;
     if (binaryRows[i + 1] === 'T') countT++;
   }
-  return (countT + base * 10) / (count + 10);
+  return (countT + base * profile.sumBandPrior) / (count + profile.sumBandPrior);
 }
 
 function diceDistributionRate(rows) {
@@ -620,13 +722,95 @@ function diceDistributionRate(rows) {
   return high + low > 0 ? high / (high + low) : null;
 }
 
-const MODEL_WEIGHTS = {
-  base: 0.16, short: 0.12, medium: 0.10, long: 0.07, ewma: 0.10,
+const DEFAULT_MODEL_WEIGHTS = {
+  base: 0.15, short: 0.11, medium: 0.10, long: 0.08, ewma: 0.10,
   markov1: 0.11, markov2: 0.10, markov3: 0.07,
-  pattern: 0.09, run: 0.08, sumBand: 0.04, dice: 0.06
+  pattern: 0.08, run: 0.06, sumBand: 0.02, dice: 0.02
 };
 
-function getComponents(history, type) {
+// Every endpoint has its own profile and learns only from that game's source file.
+// The profiles start with different time horizons; walk-forward scores then adjust
+// component weights independently for each game.
+const MODEL_PROFILES = {
+  'lc79/tx': makeModelProfile('lc79-tx-adaptive', {
+    shortWindow: 10, mediumWindow: 30, longWindow: 72, ewmaAlpha: 0.13,
+    markovPriors: [7, 11, 15], patternMaxOrder: 6, patternMinMatches: 2,
+    patternPrior: 6, runPrior: 7, sumBandPrior: 10, evalWindow: 64,
+    weights: { short: 0.15, medium: 0.09, long: 0.05, ewma: 0.11, markov1: 0.11, markov2: 0.11, markov3: 0.08, pattern: 0.12, run: 0.08, sumBand: 0.03, dice: 0.06 }
+  }),
+  'lc79/md5': makeModelProfile('lc79-md5-adaptive', {
+    shortWindow: 12, mediumWindow: 34, longWindow: 78, ewmaAlpha: 0.11,
+    markovPriors: [8, 12, 16], patternMaxOrder: 6, patternMinMatches: 2,
+    patternPrior: 7, runPrior: 7, sumBandPrior: 10, evalWindow: 64,
+    weights: { short: 0.13, medium: 0.10, long: 0.06, ewma: 0.10, markov1: 0.11, markov2: 0.11, markov3: 0.09, pattern: 0.11, run: 0.08, sumBand: 0.03, dice: 0.07 }
+  }),
+  'lc79/xocdia': makeModelProfile('lc79-xocdia-parity', {
+    shortWindow: 16, mediumWindow: 42, longWindow: 96, ewmaAlpha: 0.09,
+    markovPriors: [9, 13, 17], patternMaxOrder: 5, patternMinMatches: 3,
+    patternPrior: 8, runPrior: 9, sumBandPrior: 12, evalWindow: 60,
+    weights: { short: 0.10, medium: 0.11, long: 0.09, ewma: 0.10, markov1: 0.12, markov2: 0.11, markov3: 0.06, pattern: 0.08, run: 0.08 }
+  }),
+  'betvip/tx': makeModelProfile('betvip-tx-balanced', {
+    shortWindow: 14, mediumWindow: 40, longWindow: 90, ewmaAlpha: 0.10,
+    markovPriors: [8, 13, 17], patternMaxOrder: 5, patternMinMatches: 3,
+    patternPrior: 8, runPrior: 9, sumBandPrior: 11, evalWindow: 58,
+    weights: { short: 0.12, medium: 0.12, long: 0.08, ewma: 0.11, markov1: 0.12, markov2: 0.10, markov3: 0.06, pattern: 0.09, run: 0.07, sumBand: 0.03, dice: 0.05 }
+  }),
+  'betvip/md5': makeModelProfile('betvip-md5-context', {
+    shortWindow: 12, mediumWindow: 36, longWindow: 84, ewmaAlpha: 0.11,
+    markovPriors: [8, 12, 16], patternMaxOrder: 6, patternMinMatches: 2,
+    patternPrior: 7, runPrior: 8, sumBandPrior: 10, evalWindow: 60,
+    weights: { short: 0.12, medium: 0.10, long: 0.07, ewma: 0.11, markov1: 0.11, markov2: 0.11, markov3: 0.08, pattern: 0.10, run: 0.07, sumBand: 0.03, dice: 0.06 }
+  }),
+  'max789/tx': makeModelProfile('max789-tx-longer-context', {
+    shortWindow: 18, mediumWindow: 48, longWindow: 112, ewmaAlpha: 0.075,
+    markovPriors: [10, 15, 20], patternMaxOrder: 5, patternMinMatches: 3,
+    patternPrior: 9, runPrior: 10, sumBandPrior: 12, evalWindow: 64,
+    weights: { short: 0.08, medium: 0.12, long: 0.11, ewma: 0.08, markov1: 0.13, markov2: 0.11, markov3: 0.06, pattern: 0.08, run: 0.07, sumBand: 0.03, dice: 0.08 }
+  }),
+  'max789/md5': makeModelProfile('max789-md5-longer-context', {
+    shortWindow: 16, mediumWindow: 46, longWindow: 108, ewmaAlpha: 0.08,
+    markovPriors: [9, 14, 19], patternMaxOrder: 5, patternMinMatches: 3,
+    patternPrior: 9, runPrior: 10, sumBandPrior: 12, evalWindow: 64,
+    weights: { short: 0.09, medium: 0.12, long: 0.10, ewma: 0.09, markov1: 0.12, markov2: 0.11, markov3: 0.07, pattern: 0.09, run: 0.07, sumBand: 0.03, dice: 0.08 }
+  }),
+  'max789/kubet': makeModelProfile('max789-kubet-context', {
+    shortWindow: 14, mediumWindow: 42, longWindow: 96, ewmaAlpha: 0.09,
+    markovPriors: [8, 13, 18], patternMaxOrder: 5, patternMinMatches: 3,
+    patternPrior: 8, runPrior: 9, sumBandPrior: 11, evalWindow: 60,
+    weights: { short: 0.10, medium: 0.12, long: 0.09, ewma: 0.10, markov1: 0.12, markov2: 0.11, markov3: 0.07, pattern: 0.09, run: 0.07, sumBand: 0.03, dice: 0.08 }
+  }),
+  'hitclub/tx': makeModelProfile('hitclub-tx-recent-context', {
+    shortWindow: 12, mediumWindow: 36, longWindow: 88, ewmaAlpha: 0.11,
+    markovPriors: [8, 12, 17], patternMaxOrder: 6, patternMinMatches: 2,
+    patternPrior: 7, runPrior: 8, sumBandPrior: 10, evalWindow: 58,
+    weights: { short: 0.13, medium: 0.11, long: 0.07, ewma: 0.11, markov1: 0.12, markov2: 0.10, markov3: 0.07, pattern: 0.10, run: 0.07, sumBand: 0.03, dice: 0.06 }
+  }),
+  'hitclub/md5': makeModelProfile('hitclub-md5-pattern-context', {
+    shortWindow: 10, mediumWindow: 34, longWindow: 80, ewmaAlpha: 0.12,
+    markovPriors: [7, 12, 16], patternMaxOrder: 6, patternMinMatches: 2,
+    patternPrior: 7, runPrior: 8, sumBandPrior: 10, evalWindow: 58,
+    weights: { short: 0.14, medium: 0.10, long: 0.06, ewma: 0.12, markov1: 0.11, markov2: 0.10, markov3: 0.08, pattern: 0.11, run: 0.07, sumBand: 0.03, dice: 0.06 }
+  }),
+  'sunwin/sicbo': makeModelProfile('sunwin-sicbo-distribution', {
+    shortWindow: 16, mediumWindow: 48, longWindow: 110, ewmaAlpha: 0.08,
+    markovPriors: [10, 15, 20], patternMaxOrder: 5, patternMinMatches: 3,
+    patternPrior: 9, runPrior: 10, sumBandPrior: 12, evalWindow: 64,
+    weights: { short: 0.09, medium: 0.12, long: 0.11, ewma: 0.08, markov1: 0.12, markov2: 0.10, markov3: 0.06, pattern: 0.08, run: 0.07, sumBand: 0.05, dice: 0.10 }
+  }),
+  'sunhot/tx': makeModelProfile('sunhot-tx-short-medium', {
+    shortWindow: 12, mediumWindow: 38, longWindow: 90, ewmaAlpha: 0.10,
+    markovPriors: [8, 13, 18], patternMaxOrder: 5, patternMinMatches: 3,
+    patternPrior: 8, runPrior: 9, sumBandPrior: 11, evalWindow: 58,
+    weights: { short: 0.12, medium: 0.12, long: 0.09, ewma: 0.10, markov1: 0.12, markov2: 0.10, markov3: 0.06, pattern: 0.09, run: 0.07, sumBand: 0.03, dice: 0.07 }
+  })
+};
+
+function getModelProfile(gameId) {
+  return MODEL_PROFILES[gameId] || makeModelProfile('default-balanced', { weights: DEFAULT_MODEL_WEIGHTS });
+}
+
+function getComponents(history, type, profile) {
   const usableRows = history.filter(row => binarySide(row.side, type));
   const sides = usableRows.map(row => binarySide(row.side, type));
   const n = sides.length;
@@ -636,19 +820,21 @@ function getComponents(history, type) {
   const base = (tCount + 5) / (n + 10);
   const components = {
     base,
-    short: smoothedRate(sides.slice(-12), base, 6),
-    medium: smoothedRate(sides.slice(-35), base, 10),
-    long: smoothedRate(sides.slice(-80), base, 16),
-    markov1: markovRate(sides, 1, base, 8),
-    markov2: markovRate(sides, 2, base, 12),
-    markov3: markovRate(sides, 3, base, 16),
-    pattern: patternRate(sides, base),
-    run: runRate(sides, base),
-    sumBand: sumBandRate(usableRows, sides, base)
+    short: smoothedRate(sides.slice(-profile.shortWindow), base, 6),
+    medium: smoothedRate(sides.slice(-profile.mediumWindow), base, 10),
+    long: smoothedRate(sides.slice(-profile.longWindow), base, 16),
+    markov1: markovRate(sides, 1, base, profile.markovPriors[0]),
+    markov2: markovRate(sides, 2, base, profile.markovPriors[1]),
+    markov3: markovRate(sides, 3, base, profile.markovPriors[2]),
+    pattern: patternRate(sides, base, profile),
+    run: runRate(sides, base, profile),
+    sumBand: sumBandRate(usableRows, sides, base, profile)
   };
 
   let ewma = base;
-  for (const side of sides.slice(-80)) ewma = 0.90 * ewma + 0.10 * (side === 'T' ? 1 : 0);
+  for (const side of sides.slice(-profile.longWindow)) {
+    ewma = (1 - profile.ewmaAlpha) * ewma + profile.ewmaAlpha * (side === 'T' ? 1 : 0);
+  }
   const ewmaReliability = Math.min(1, n / 35);
   components.ewma = base * (1 - ewmaReliability) + ewma * ewmaReliability;
 
@@ -656,15 +842,16 @@ function getComponents(history, type) {
     const diceRate = diceDistributionRate(usableRows);
     if (diceRate !== null) {
       // Giảm ảnh hưởng mô hình xúc xắc khi chưa đủ nhiều phiên.
-      const diceReliability = Math.min(0.45, Math.max(0, (n - 10) / 180));
+      const diceReliability = Math.min(profile.diceMaxReliability, Math.max(0, (n - 10) / 180));
       components.dice = base * (1 - diceReliability) + diceRate * diceReliability;
     }
   }
   return { components, sides, n, run: currentRun(sides), last: sides[n - 1], usableRows };
 }
 
-function modelProbability(history, type) {
-  const current = getComponents(history, type);
+function modelProbability(history, type, gameId = 'default') {
+  const profile = getModelProfile(gameId);
+  const current = getComponents(history, type, profile);
   if (!current) return null;
   const { components, sides, n, run, last, usableRows } = current;
   const adaptive = {};
@@ -672,12 +859,12 @@ function modelProbability(history, type) {
   // Tự chấm từng mô hình trên các phiên đã xảy ra (walk-forward), không dùng
   // kết quả tương lai của phiên đang dự đoán. Độ tin cậy được co về 50% để
   // tránh một đoạn cầu ngắn làm thay đổi trọng số quá mạnh.
-  const start = Math.max(12, n - 55);
+  const start = Math.max(profile.backtestMin, n - profile.evalWindow);
   const wins = {};
   const trials = {};
   for (let i = start; i < n; i++) {
     const pastRows = usableRows.slice(0, i);
-    const sample = getComponents(pastRows, type);
+    const sample = getComponents(pastRows, type, profile);
     if (!sample) continue;
     const actual = sides[i];
     for (const [key, probability] of Object.entries(sample.components)) {
@@ -696,7 +883,7 @@ function modelProbability(history, type) {
     const hit = wins[key] || 0;
     const accuracy = (hit + 5) / (count + 10); // prior tương đương 10 lần thử, 5 lần đúng
     const factor = count >= 8 ? Math.max(0.72, Math.min(1.28, accuracy / 0.5)) : 1;
-    const weight = (MODEL_WEIGHTS[key] || 0.04) * factor;
+    const weight = (profile.weights[key] || DEFAULT_MODEL_WEIGHTS[key] || 0.04) * factor;
     weighted += probability * weight;
     totalWeight += weight;
     componentRows.push({ key, p: probability, weight, accuracy: count ? accuracy : null, trials: count });
@@ -725,7 +912,7 @@ function modelProbability(history, type) {
   if (!reasons.length) reasons.push('Tổng hợp tần suất, chuỗi chuyển tiếp và kiểm định lịch sử');
 
   return {
-    side, confidence, pT, n, run,
+    side, confidence, pT, n, run, profile: profile.name,
     lyDo: reasons.slice(0, 3).join(' · '),
     cau: sides.slice(-20).map(side => side === 'T' ? 'T' : 'X').join(''),
     adaptive,
@@ -788,17 +975,58 @@ class Engine {
 
   loadHistory(newestFirstRows) {
     const chronological = [...newestFirstRows].reverse();
-    this.history = chronological.filter(row => row && row.side).map(row => ({
-      session: row.session,
-      side: row.side,
-      sum: toNumber(row.sum),
-      dice: Array.isArray(row.dice) ? row.dice : [],
-      vi: row.vi || null,
-      doCount: Number.isInteger(row.doCount) ? row.doCount : redCountFromVi(row.vi),
-      trangCount: Number.isInteger(row.trangCount) ? row.trangCount : null,
-      time: row.time || null
-    }));
+    const bySession = new Map();
+    for (const row of chronological) {
+      if (!row || !row.side) continue;
+      bySession.set(String(row.session), {
+        session: row.session, side: row.side, sum: toNumber(row.sum),
+        dice: Array.isArray(row.dice) ? row.dice : [], vi: row.vi || null,
+        doCount: Number.isInteger(row.doCount) ? row.doCount : redCountFromVi(row.vi),
+        trangCount: Number.isInteger(row.trangCount) ? row.trangCount : null,
+        time: row.time || null,
+        synthetic: row.synthetic === true || row.sideSource === 'embedded_cau'
+      });
+    }
+
+    const latest = chronological[chronological.length - 1];
+    const embedded = latest && typeof latest.cau === 'string'
+      ? latest.cau.toUpperCase().replace(/[^TX]/g, '') : '';
+    if (embedded.length >= 5 && isNumericSession(latest.session) && (latest.side === 'T' || latest.side === 'X')) {
+      let sequence = embedded;
+      if (sequence[0] === latest.side && sequence[sequence.length - 1] !== latest.side) sequence = sequence.split('').reverse().join('');
+      if (sequence[sequence.length - 1] === latest.side) {
+        try {
+          const end = BigInt(String(latest.session));
+          const first = end - BigInt(sequence.length - 1);
+          if (first >= 0n) {
+            for (let i = 0; i < sequence.length; i++) {
+              const session = (first + BigInt(i)).toString();
+              if (!bySession.has(session)) bySession.set(session, {
+                session, side: sequence[i], sum: null, dice: [], vi: null,
+                doCount: null, trangCount: null, time: null, synthetic: true
+              });
+            }
+          }
+        } catch (_) { /* ignore malformed session sequence */ }
+      }
+    }
+
+    this.history = Array.from(bySession.values()).sort((a, b) => {
+      if (isNumericSession(a.session) && isNumericSession(b.session)) {
+        const aa = BigInt(String(a.session)), bb = BigInt(String(b.session));
+        return aa < bb ? -1 : aa > bb ? 1 : 0;
+      }
+      return String(a.session).localeCompare(String(b.session));
+    });
     if (this.history.length > SOURCE_LIMIT) this.history = this.history.slice(-SOURCE_LIMIT);
+  }
+
+  validSampleCount() {
+    return this.history.filter(row => binarySide(row.side, this.type)).length;
+  }
+
+  isReady() {
+    return this.validSampleCount() >= MIN_HISTORY_SESSIONS;
   }
 
   currentCau(maxLen = 20) {
@@ -812,8 +1040,16 @@ class Engine {
   }
 
   predict() {
+    if (!this.isReady()) {
+      return {
+        ready: false,
+        sampleSize: this.validSampleCount(),
+        requiredSamples: MIN_HISTORY_SESSIONS,
+        lyDo: `Đang học dữ liệu: cần tối thiểu ${MIN_HISTORY_SESSIONS} phiên hợp lệ`
+      };
+    }
     if (this.type === 'xocdia') {
-      const model = modelProbability(this.history, 'xocdia');
+      const model = modelProbability(this.history, 'xocdia', this.id);
       if (!model) {
         const side = 'CHAN';
         const ranked = xocdiaPatternRanking(this.history, side);
@@ -836,7 +1072,7 @@ class Engine {
       };
     }
 
-    const model = modelProbability(this.history, this.type);
+    const model = modelProbability(this.history, this.type, this.id);
     if (!model) {
       return {
         side: 'T', label: 'Tài', conf: 50,
@@ -896,20 +1132,45 @@ function settlePredictionLogs(gameId, rows) {
   const game = GAMES[gameId];
   let changed = false;
   for (const log of logs) {
-    if (!log || log.ok === true || log.ok === false || log.phien == null) continue;
+    if (!log || log.phien == null) continue;
+    // A protected skip is not a bet and must never be settled as a win/loss.
+    if (log.risk_pause === true) continue;
     const actualRow = findSourceResult(rows, log.phien);
-    if (!actualRow || !actualRow.side) continue;
+    if (!actualRow) continue;
     const predictedSide = log.pred_side || getPredictionSide(log.du_doan);
-    log.actual = sideLabel(actualRow.side);
-    log.actual_side = actualRow.side;
-    log.actual_dice = actualDiceText(actualRow, game.type);
-    log.actual_sum = actualRow.sum == null ? null : actualRow.sum;
-    log.actual_vi = game.type === 'xocdia' ? actualDiceText(actualRow, game.type) : null;
-    log.ok = predictedSide === actualRow.side;
-    log.result_time = nowVN();
-    changed = true;
+
+    if (actualRow.sideSource === 'triple') {
+      const next = {
+        actual: 'Bộ ba', actual_side: null,
+        actual_dice: actualDiceText(actualRow, game.type),
+        actual_sum: actualRow.sum == null ? null : actualRow.sum,
+        actual_vi: game.type === 'xocdia' ? actualDiceText(actualRow, game.type) : null,
+        ok: null, void: true, data_warning: actualRow.dataWarning || null
+      };
+      const rowChanged = Object.keys(next).some(key => log[key] !== next[key]);
+      if (rowChanged) changed = true;
+      Object.assign(log, next);
+      if (rowChanged || !log.result_time) log.result_time = nowVN();
+      continue;
+    }
+    if (!actualRow.side || !predictedSide) continue;
+
+    const next = {
+      actual: sideLabel(actualRow.side), actual_side: actualRow.side,
+      actual_dice: actualDiceText(actualRow, game.type),
+      actual_sum: actualRow.sum == null ? null : actualRow.sum,
+      actual_vi: game.type === 'xocdia' ? actualDiceText(actualRow, game.type) : null,
+      ok: predictedSide === actualRow.side, void: false,
+      data_warning: actualRow.dataWarning || null
+    };
+    const rowChanged = Object.keys(next).some(key => log[key] !== next[key]);
+    if (rowChanged) changed = true;
+    const wasSettled = log.ok === true || log.ok === false;
+    Object.assign(log, next);
+    if (!wasSettled || rowChanged || log.result_time == null) log.result_time = nowVN();
   }
   if (changed) saveJSON('pred_history.json', predHistory);
+  return changed;
 }
 
 function pushPredLog(gameId, entry) {
@@ -927,6 +1188,27 @@ function pushPredLog(gameId, entry) {
   return entry;
 }
 
+function consecutiveLossState(gameId, ignorePendingSession = null) {
+  const logs = Array.isArray(predHistory[gameId]) ? predHistory[gameId] : [];
+  let count = 0;
+  for (const entry of logs) {
+    if (!entry) continue;
+    if (ignorePendingSession != null && String(entry.phien) === String(ignorePendingSession) &&
+        entry.risk_pause !== true && entry.ok == null) continue;
+    // A skipped forecast creates a deliberate gap and breaks the active loss run.
+    if (entry.risk_pause === true) return { count: 0, lastLossSession: null, protectedGap: true };
+    if (entry.void === true) continue;
+    if (entry.ok === false) {
+      count++;
+      if (count === 1) var lastLossSession = String(entry.phien);
+      continue;
+    }
+    // A win or an unsettled result ends the consecutive settled-loss sequence.
+    break;
+  }
+  return { count, lastLossSession: count ? lastLossSession : null, protectedGap: false };
+}
+
 function nextSessionOf(latest) {
   if (!latest) return '—';
   if (latest.nextSession !== undefined && latest.nextSession !== null && String(latest.nextSession) !== '') {
@@ -940,6 +1222,19 @@ function nextSessionOf(latest) {
 }
 
 function predictionFromLog(log, game) {
+  if (log && log.risk_pause === true) {
+    return {
+      paused: true,
+      side: null,
+      label: null,
+      conf: null,
+      lyDo: log.pause_reason || 'Tạm dừng bảo vệ sau chuỗi dự đoán sai',
+      cau: log.cau || '',
+      vi: null,
+      topVi: [],
+      topSums: []
+    };
+  }
   return {
     side: log.pred_side || getPredictionSide(log.du_doan) || 'T',
     label: log.du_doan || 'Tài',
@@ -950,6 +1245,44 @@ function predictionFromLog(log, game) {
     topVi: Array.isArray(log.top_vi) ? log.top_vi : [],
     topSums: Array.isArray(log.top_sums) ? log.top_sums : []
   };
+}
+
+/* ======================= EMBEDDED SOURCE HISTORY ======================== */
+function expandEmbeddedCauRows(rows) {
+  if (!Array.isArray(rows) || !rows.length) return [];
+  const candidates = rows.filter(row => row && row.cau && isNumericSession(row.session) && (row.side === 'T' || row.side === 'X'));
+  if (!candidates.length) return [];
+  candidates.sort((a, b) => {
+    if (isNumericSession(a.session) && isNumericSession(b.session)) {
+      const aa = BigInt(String(a.session)), bb = BigInt(String(b.session));
+      return aa > bb ? -1 : aa < bb ? 1 : 0;
+    }
+    return 0;
+  });
+  const latest = candidates[0];
+  let sequence = String(latest.cau).toUpperCase().replace(/[^TX]/g, '');
+  if (sequence.length < 5) return [];
+  if (sequence[sequence.length - 1] !== latest.side && sequence[0] === latest.side) {
+    sequence = sequence.split('').reverse().join('');
+  }
+  // Chỉ import nếu một đầu chuỗi khớp kết quả đã kiểm chứng của phiên hiện tại.
+  if (sequence[sequence.length - 1] !== latest.side) return [];
+  try {
+    const end = BigInt(String(latest.session));
+    const first = end - BigInt(sequence.length - 1);
+    if (first < 0n) return [];
+    const expanded = [];
+    for (let i = 0; i < sequence.length - 1; i++) {
+      expanded.push({
+        session: (first + BigInt(i)).toString(), side: sequence[i],
+        sideSource: 'embedded_cau', synthetic: true,
+        dice: [], sum: null, time: null
+      });
+    }
+    return expanded;
+  } catch (_) {
+    return [];
+  }
 }
 
 /* ============================== FETCH / PREDICT ========================== */
@@ -963,7 +1296,8 @@ async function fetchGame(gameId) {
   if (!Array.isArray(parsed) || !parsed.length) {
     throw new Error('API nguồn không trả về phiên hợp lệ hoặc cấu trúc JSON đã thay đổi');
   }
-  const rows = mergeSourceHistory(gameId, parsed);
+  const embeddedRows = expandEmbeddedCauRows(parsed);
+  const rows = mergeSourceHistory(gameId, [...parsed, ...embeddedRows]);
   if (!rows.length) throw new Error('Không có lịch sử phiên sau khi chuẩn hóa');
   return { game, rows };
 }
@@ -974,38 +1308,12 @@ async function runPredictInternal(gameId) {
   engine.loadHistory(rows);
   settlePredictionLogs(gameId, rows);
 
-  // Chỉ dự đoán một lần cho mỗi phiên đích. Poll nhiều lần không làm thay đổi
-  // dự đoán đang chờ và không tạo các dòng lịch sử trùng nhau.
   const latest = rows[0] || {};
   const nextSession = nextSessionOf(latest);
   if (nextSession === '—') throw new Error('Không xác định được phiên tiếp theo');
-  const existingLogs = Array.isArray(predHistory[gameId]) ? predHistory[gameId] : [];
-  let log = existingLogs.find(item => String(item.phien) === String(nextSession));
 
-  let pred;
-  if (log) {
-    pred = predictionFromLog(log, game);
-  } else {
-    pred = engine.predict();
-    log = pushPredLog(gameId, {
-      phien: nextSession,
-      du_doan: pred.label,
-      pred_side: pred.side,
-      conf: pred.conf,
-      ly_do: pred.lyDo || null,
-      cau: pred.cau || null,
-      vi: pred.vi || null,
-      top_vi: pred.topVi || [],
-      top_sums: pred.topSums || [],
-      actual: null,
-      actual_side: null,
-      actual_dice: null,
-      ok: null,
-      time: nowVN()
-    });
-  }
-
-  const payload = {
+  const sampleCount = engine.validSampleCount();
+  const basePayload = {
     id: IDOL,
     Name: game.label,
     Phien: latest.session != null
@@ -1014,25 +1322,123 @@ async function runPredictInternal(gameId) {
     Xuc_xac: actualDiceText(latest, game.type),
     Tong: latest.sum == null ? null : latest.sum,
     Ket_qua: sideLabel(latest.side),
-    Cau_hien_tai: pred.cau || engine.currentCau(20),
+    Cau_hien_tai: engine.currentCau(20),
     Phien_tiep: isNumericSession(nextSession) ? Number(nextSession) : nextSession,
-    Du_doan: pred.label,
-    Du_doan_side: pred.side,
-    do_tin_cay: pred.conf,
-    Ly_do: pred.lyDo || 'Tổng hợp thống kê lịch sử',
-    Sample_size: pred.sampleSize || engine.history.length,
-    Time: nowVN()
+    Time: nowVN(),
+    Data_warning: latest.dataWarning || null,
+    API_sample_size: latest.apiSampleSize || null,
+    Sample_size: sampleCount,
+    So_phien_toi_thieu: MIN_HISTORY_SESSIONS
   };
 
-  if (game.type === 'sicbo') payload.Ba_tong_de_ra = pred.topSums || [];
-  if (game.type === 'xocdia') {
-    payload.Vi = pred.vi || null;
-    payload.Top_vi = pred.topVi || [];
-    payload.Top_vi_chi_tiet = pred.viDetails || [];
-    payload.Du_doan_vi = pred.vi || null;
+  // Warm-up applies independently to every game. Existing persisted source
+  // sessions are reused; APIs that return only the current round accumulate
+  // distinct sessions through polling until five valid outcomes exist.
+  if (sampleCount < MIN_HISTORY_SESSIONS) {
+    const remaining = MIN_HISTORY_SESSIONS - sampleCount;
+    lastStatus[gameId] = {
+      ok: null, mode: 'learning', samples: sampleCount,
+      required: MIN_HISTORY_SESSIONS, error: null, time: nowVN()
+    };
+    return {
+      ...basePayload,
+      Trang_thai: 'DANG_HOC_DU_LIEU',
+      Is_ready: false,
+      Con_thieu: remaining,
+      Du_doan: null,
+      Du_doan_side: null,
+      do_tin_cay: null,
+      Ly_do: `Đang thu thập dữ liệu riêng cho ${game.label}: đã có ${sampleCount}/${MIN_HISTORY_SESSIONS} phiên hợp lệ; chưa phát dự đoán`,
+      Model_profile: getModelProfile(gameId).name
+    };
   }
 
-  lastStatus[gameId] = { ok: true, error: null, time: nowVN() };
+  // One forecast (or one deliberate skip) per target session.
+  const existingLogs = Array.isArray(predHistory[gameId]) ? predHistory[gameId] : [];
+  let log = existingLogs.find(item => String(item.phien) === String(nextSession));
+  let pred;
+
+  if (log) {
+    pred = predictionFromLog(log, game);
+  } else {
+    const lossState = consecutiveLossState(gameId);
+    if (lossState.count >= 3) {
+      const reason = `Tạm dừng 1 phiên để hiệu chỉnh sau ${lossState.count} dự đoán sai liên tiếp; không tiếp tục đuổi cầu`;
+      log = pushPredLog(gameId, {
+        phien: nextSession,
+        du_doan: 'Tạm dừng bảo vệ',
+        pred_side: null,
+        conf: null,
+        ly_do: reason,
+        pause_reason: reason,
+        cau: engine.currentCau(20),
+        actual: null,
+        actual_side: null,
+        actual_dice: null,
+        ok: null,
+        void: false,
+        risk_pause: true,
+        loss_streak_before_pause: lossState.count,
+        time: nowVN()
+      });
+      pred = predictionFromLog(log, game);
+    } else {
+      pred = engine.predict();
+      if (!pred || pred.ready === false) {
+        throw new Error('Dữ liệu chưa đủ để khởi tạo mô hình dự đoán');
+      }
+      log = pushPredLog(gameId, {
+        phien: nextSession,
+        du_doan: pred.label,
+        pred_side: pred.side,
+        conf: pred.conf,
+        ly_do: pred.lyDo || null,
+        cau: pred.cau || null,
+        vi: pred.vi || null,
+        top_vi: pred.topVi || [],
+        top_sums: pred.topSums || [],
+        model_profile: pred.profile || getModelProfile(gameId).name,
+        training_sample_size: pred.sampleSize || sampleCount,
+        actual: null,
+        actual_side: null,
+        actual_dice: null,
+        ok: null,
+        time: nowVN()
+      });
+    }
+  }
+
+  const payload = {
+    ...basePayload,
+    Cau_hien_tai: pred.cau || engine.currentCau(20),
+    Du_doan: pred.paused ? null : pred.label,
+    Du_doan_side: pred.paused ? null : pred.side,
+    do_tin_cay: pred.paused ? null : pred.conf,
+    Ly_do: pred.lyDo || 'Tổng hợp thống kê lịch sử riêng của game',
+    Sample_size: pred.sampleSize || sampleCount,
+    Model_profile: log.model_profile || getModelProfile(gameId).name,
+    Consecutive_losses: pred.paused ? (log.loss_streak_before_pause || 3) : consecutiveLossState(gameId, nextSession).count,
+    Trang_thai: pred.paused ? 'TAM_DUNG_BAO_VE' : 'DA_SAN_SANG',
+    Is_ready: true,
+    Con_thieu: 0
+  };
+
+  if (game.type === 'sicbo' && !pred.paused) payload.Ba_tong_de_ra = pred.topSums || [];
+  if (game.type === 'xocdia') {
+    payload.Vi = pred.paused ? null : (pred.vi || null);
+    payload.Top_vi = pred.paused ? [] : (pred.topVi || []);
+    payload.Top_vi_chi_tiet = pred.paused ? [] : (pred.viDetails || []);
+    payload.Du_doan_vi = pred.paused ? null : (pred.vi || null);
+  }
+
+  lastStatus[gameId] = {
+    ok: true,
+    mode: pred.paused ? 'protected' : 'online',
+    samples: sampleCount,
+    required: MIN_HISTORY_SESSIONS,
+    error: null,
+    time: nowVN()
+  };
   return payload;
 }
 
@@ -1078,7 +1484,11 @@ app.get('/', (_req, res) => {
       game: id,
       name: game.label,
       type: game.type,
-      status: status.ok === true ? 'online' : status.ok === false ? 'error' : 'pending',
+      status: status.ok === true
+        ? (status.mode === 'protected' ? 'protected' : 'online')
+        : status.ok === false ? 'error' : status.mode === 'learning' ? 'learning' : 'pending',
+      sample_size: status.samples || 0,
+      required_samples: status.required || MIN_HISTORY_SESSIONS,
       error: status.error || null,
       last_update: status.time,
       predict: `/${id}`,
@@ -1087,13 +1497,16 @@ app.get('/', (_req, res) => {
   });
   const online = games.filter(game => game.status === 'online').length;
   res.json({
-    id: IDOL, name: 'PRED-API', version: '2.0.0', time: nowVN(),
-    total_games: games.length, online, offline: games.length - online, games
+    id: IDOL, name: 'PRED-API', version: '4.0.0', time: nowVN(),
+    total_games: games.length, online,
+    learning: games.filter(game => game.status === 'learning').length,
+    protected: games.filter(game => game.status === 'protected').length,
+    offline: games.filter(game => game.status === 'error').length, games
   });
 });
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, id: IDOL, version: '2.0.0', time: nowVN(), games: Object.keys(GAMES).length });
+  res.json({ ok: true, id: IDOL, version: '4.0.0', time: nowVN(), games: Object.keys(GAMES).length, min_history_sessions: MIN_HISTORY_SESSIONS });
 });
 
 app.get('/games', (_req, res) => {
@@ -1105,15 +1518,22 @@ app.get('/games', (_req, res) => {
     predict: `/${id}`,
     history: `/${id}/history`,
     status: lastStatus[id] && lastStatus[id].ok === true
-      ? 'online' : lastStatus[id] && lastStatus[id].ok === false ? 'error' : 'pending'
+      ? (lastStatus[id].mode === 'protected' ? 'protected' : 'online')
+      : lastStatus[id] && lastStatus[id].ok === false ? 'error'
+        : lastStatus[id] && lastStatus[id].mode === 'learning' ? 'learning' : 'pending',
+    sample_size: lastStatus[id] && lastStatus[id].samples || 0,
+    required_samples: MIN_HISTORY_SESSIONS
   }));
-  res.json({ id: IDOL, ok: true, total: list.length, games: list });
+  res.json({ id: IDOL, ok: true, total: list.length, min_history_sessions: MIN_HISTORY_SESSIONS, games: list });
 });
 
 function formatHistoryRow(entry, game) {
   const phien = entry.phien != null ? String(entry.phien) : '—';
+  if (entry.risk_pause === true) {
+    return `Phiên ${phien} | TẠM DỪNG BẢO VỆ: ${entry.pause_reason || 'nghỉ 1 phiên sau chuỗi sai'} | ⏸️`;
+  }
   const prediction = entry.du_doan || '—';
-  const mark = entry.ok === true ? '✅' : entry.ok === false ? '❌' : '⏳';
+  const mark = entry.void === true ? '➖' : entry.ok === true ? '✅' : entry.ok === false ? '❌' : '⏳';
   const actual = entry.actual || 'Đang chờ';
   const dice = entry.actual_dice ? ` | KQ xúc xắc: ${entry.actual_dice}` : '';
   const sum = entry.actual_sum != null && game.type !== 'xocdia' ? ` (${entry.actual_sum})` : '';
@@ -1121,17 +1541,28 @@ function formatHistoryRow(entry, game) {
   return `Phiên ${phien}${dice} | KQ: ${actual}${sum} | Dự đoán: ${prediction} | ${mark}${conf}`;
 }
 
-app.get('/:brand/:table/history', (req, res) => {
+app.get('/:brand/:table/history', async (req, res) => {
   const gameId = `${req.params.brand}/${req.params.table}`;
   const game = GAMES[gameId];
   if (!game) return res.status(404).json({ ok: false, error: 'Game không tồn tại' });
+  let refreshError = null;
+  try {
+    // Gọi cùng luồng cập nhật có khóa inFlight: không nhân đôi request khi poll đang chạy.
+    await runPredict(gameId);
+  } catch (error) {
+    refreshError = error.message;
+  }
   const logs = (Array.isArray(predHistory[gameId]) ? predHistory[gameId] : []).slice(0, PRED_LIMIT);
   let correct = 0;
   let wrong = 0;
   let waiting = 0;
+  let voided = 0;
+  let paused = 0;
   for (const entry of logs) {
-    if (entry.ok === true) correct++;
+    if (entry.risk_pause === true) paused++;
+    else if (entry.ok === true) correct++;
     else if (entry.ok === false) wrong++;
+    else if (entry.void === true) voided++;
     else waiting++;
   }
   const settled = correct + wrong;
@@ -1146,8 +1577,11 @@ app.get('/:brand/:table/history', (req, res) => {
     vi: entry.actual_vi || null,
     dung: entry.ok === true,
     sai: entry.ok === false,
-    trang_thai: entry.ok === true ? 'đúng' : entry.ok === false ? 'sai' : 'đang chờ',
-    icon: entry.ok === true ? '✅' : entry.ok === false ? '❌' : '⏳',
+    bo_qua: entry.void === true,
+    tam_dung: entry.risk_pause === true,
+    trang_thai: entry.risk_pause === true ? 'tạm dừng bảo vệ' : entry.void === true ? 'bỏ qua (bộ ba)' : entry.ok === true ? 'đúng' : entry.ok === false ? 'sai' : 'đang chờ',
+    icon: entry.risk_pause === true ? '⏸️' : entry.void === true ? '➖' : entry.ok === true ? '✅' : entry.ok === false ? '❌' : '⏳',
+    canh_bao_du_lieu: entry.data_warning || null,
     do_tin_cay: entry.conf == null ? null : entry.conf,
     thoi_gian_du_doan: entry.time || null,
     thoi_gian_ket_qua: entry.result_time || null
@@ -1160,7 +1594,14 @@ app.get('/:brand/:table/history', (req, res) => {
     dung: correct,
     sai: wrong,
     cho: waiting,
+    bo_qua: voided,
+    tam_dung: paused,
+    learning_ready: (getEngine(gameId).validSampleCount() >= MIN_HISTORY_SESSIONS),
+    learning_sessions: getEngine(gameId).validSampleCount(),
+    required_learning_sessions: MIN_HISTORY_SESSIONS,
     ti_le: settled ? Math.round((correct / settled) * 100) : 0,
+    refresh_error: refreshError,
+    updated_at: nowVN(),
     items,
     history: logs.map(entry => formatHistoryRow(entry, game))
   });
@@ -1191,7 +1632,7 @@ app.get('/:brand/:table', async (req, res) => {
 let server = null;
 if (require.main === module) {
   server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`PRED-API v2.0 on :${PORT}`);
+    console.log(`PRED-API v4.0 on :${PORT}`);
     console.log('Polling:', POLL_MS, 'ms');
     console.log('Games:', Object.keys(GAMES).join(', '));
   });
@@ -1201,8 +1642,10 @@ if (require.main === module) {
 module.exports = {
   app, GAMES, PARSERS, Engine, mergeSourceHistory,
   parseLc79List, parseLc79Xocdia, parseHitclub, parseMax789,
-  parseSunwinSicbo, parseSunhot, modelProbability,
-  formatXocdia, redCountFromVi, sideLabel,
-  settlePredictionLogs, pushPredLog, formatHistoryRow, fetchGame, runPredict,
+  parseSunwinSicbo, parseSunhot, modelProbability, MODEL_PROFILES, getModelProfile,
+  formatXocdia, redCountFromVi, sideLabel, sideFromSum,
+  getSum, resolveTxOutcome,
+  settlePredictionLogs, pushPredLog, formatHistoryRow, fetchGame, runPredict, expandEmbeddedCauRows,
+  consecutiveLossState,
   _state: { engines, predHistory, lastStatus }
 };
