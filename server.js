@@ -1,5 +1,5 @@
 /**
- * PRED-API v4.0 — TX / Sicbo / Xóc đĩa đa game
+ * PRED-API v5.0 — Tài Xỉu / Xóc Đĩa đa game
  * Node >= 18 | Render: npm install && npm start
  *
  * Lưu ý: dữ liệu kết quả là ngẫu nhiên/được tạo bởi hệ thống game. Bộ phân tích
@@ -17,7 +17,7 @@ const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 const POLL_MS = Math.max(10000, Number(process.env.POLL_MS) || 25000);
 const SOURCE_LIMIT = Math.max(200, Number(process.env.SOURCE_LIMIT) || 1200);
-const PRED_LIMIT = Math.max(20, Number(process.env.PRED_HISTORY_LIMIT) || 50);
+const PRED_LIMIT = Math.max(20, Number(process.env.PRED_HISTORY_LIMIT) || 80);
 // Never emit a forecast from fewer than five distinct, usable source sessions.
 const MIN_HISTORY_SESSIONS = Math.max(5, Number(process.env.MIN_HISTORY_SESSIONS) || 5);
 const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, 'data');
@@ -39,11 +39,6 @@ const http = axios.create({
 
 /* ============================== GAME CONFIG ============================== */
 const GAMES = {
-  'sunwin/sicbo': {
-    label: 'SUNWIN Sicbo', type: 'sicbo',
-    url: 'https://api.wsktnus8.net/v2/history/getLastResult?gameId=ktrng_3979&size=100&tableId=39791215743193&curPage=1',
-    parser: 'sunwinSicbo'
-  },
   'sunhot/tx': {
     label: 'SUNHOT Tài Xỉu', type: 'tx',
     url: 'https://su-vipp-3.onrender.com/sun/khnguyen',
@@ -218,6 +213,89 @@ function sideLabel(side) {
   return side || null;
 }
 
+function gameSideLabel(side, type) {
+  if (type === 'xocdia') return side === 'CHAN' ? 'Chẵn' : side === 'LE' ? 'Lẻ' : null;
+  return sideLabel(side);
+}
+
+function analyzeRoad(history, type) {
+  const sides = (Array.isArray(history) ? history : [])
+    .map(row => binarySide(row.side, type)).filter(Boolean);
+  const recent = sides.slice(-20);
+  if (!recent.length) return {
+    dang_cau: 'chưa đủ dữ liệu', do_dai_bet: 0,
+    cua_dang_bet: null, chuoi_20_phien: []
+  };
+  const last = recent[recent.length - 1];
+  let run = 1;
+  for (let i = recent.length - 2; i >= 0 && recent[i] === last; i--) run++;
+  const runs = [];
+  for (const side of recent) {
+    const tail = runs[runs.length - 1];
+    if (tail && tail.side === side) tail.count++;
+    else runs.push({ side, count: 1 });
+  }
+  let road = 'cầu hỗn hợp';
+  if (run >= 3) road = `bệt ${run} phiên`;
+  else if (runs.length >= 4) {
+    const lastFour = runs.slice(-4);
+    if (lastFour.every(item => item.count === lastFour[0].count)) {
+      const block = lastFour[0].count;
+      if (block >= 1 && block <= 3) road = `cầu ${block}-${block}`;
+    }
+  }
+  const label = side => type === 'xocdia' ? (side === 'T' ? 'Chẵn' : 'Lẻ') : (side === 'T' ? 'Tài' : 'Xỉu');
+  return {
+    dang_cau: road,
+    do_dai_bet: run,
+    cua_dang_bet: label(last),
+    chuoi_20_phien: recent.map(label)
+  };
+}
+
+function currentRoadVietnamese(history, type, maxLen = 20) {
+  const label = side => type === 'xocdia'
+    ? (side === 'CHAN' ? 'Chẵn' : side === 'LE' ? 'Lẻ' : null)
+    : (side === 'T' ? 'Tài' : side === 'X' ? 'Xỉu' : null);
+  return (Array.isArray(history) ? history : [])
+    .slice(-maxLen)
+    .map(row => label(row.side))
+    .filter(Boolean)
+    .join(' → ');
+}
+
+function summarizeGameStats(gameId) {
+  const logs = Array.isArray(predHistory[gameId]) ? predHistory[gameId] : [];
+  let correct = 0, wrong = 0, waiting = 0, voided = 0, paused = 0;
+  for (const entry of logs) {
+    if (!entry) continue;
+    if (entry.risk_pause === true) paused++;
+    else if (entry.ok === true) correct++;
+    else if (entry.ok === false) wrong++;
+    else if (entry.void === true) voided++;
+    else waiting++;
+  }
+  const settled = correct + wrong;
+  return {
+    tong_phien: logs.length,
+    dung: correct,
+    sai: wrong,
+    dang_cho: waiting,
+    bo_qua: voided,
+    tam_dung: paused,
+    da_chot: settled,
+    ti_le_dung: settled ? Math.round((correct / settled) * 1000) / 10 : 0
+  };
+}
+
+function vietnameseGameStatus(id) {
+  const status = lastStatus[id] || {};
+  if (status.ok === true) return status.mode === 'protected' ? 'tạm dừng bảo vệ' : 'đang hoạt động';
+  if (status.ok === false) return 'mất kết nối';
+  if (status.mode === 'learning') return 'đang học dữ liệu';
+  return 'đang chờ dữ liệu';
+}
+
 function isNumericSession(value) {
   return /^-?\d+$/.test(String(value == null ? '' : value).trim());
 }
@@ -329,11 +407,11 @@ function resolveTxOutcome(row, dice, sum) {
   const reportedSum = getReportedSum(row);
   const warnings = [];
   if (validDice && reportedSum !== null && reportedSum !== sourceSum) {
-    warnings.push(`Tong API ${reportedSum} lệch tổng xúc xắc ${sourceSum}`);
+    warnings.push(`Tổng từ API ${reportedSum} lệch tổng xúc xắc ${sourceSum}`);
   }
   if (declared === 'T' || declared === 'X') {
-    if (triple) warnings.push(`Ket_qua API ${sideLabel(declared)} nhưng xúc xắc là bộ ba`);
-    else if (side && declared !== side) warnings.push(`Ket_qua API ${sideLabel(declared)} lệch kết quả tính từ xúc xắc ${sideLabel(side)}`);
+    if (triple) warnings.push(`Kết quả từ API là ${sideLabel(declared)} nhưng xúc xắc là bộ ba`);
+    else if (side && declared !== side) warnings.push(`Kết quả từ API là ${sideLabel(declared)} nhưng tính từ xúc xắc ra ${sideLabel(side)}`);
   }
   return {
     side,
@@ -375,24 +453,21 @@ function normalizeColor(value) {
 }
 
 function redCountFromVi(value) {
-  const s = normText(value).replace(/[_-]/g, ' ');
+  if (value == null) return null;
+  const s = normText(value).replace(/[_–—-]+/g, ' ').replace(/[,/]+/g, ' ');
   if (!s) return null;
-  const digit = s.match(/\b([0-4])\b/);
-  const wordMap = { zero: 0, one: 1, two: 2, three: 3, four: 4, mot: 1, hai: 2, ba: 3, bon: 4 };
-  let count = digit ? Number(digit[1]) : null;
-  if (count === null) {
-    for (const [word, num] of Object.entries(wordMap)) {
-      if (new RegExp(`\\b${word}\\b`).test(s)) { count = num; break; }
-    }
-  }
-  if (count === null) return null;
-  const redMatch = s.match(/([0-4])\s*(do|red)/);
+  const redMatch = s.match(/([0-4])\s*(do|red)\b/);
+  const whiteMatch = s.match(/([0-4])\s*(trang|white)\b/);
   if (redMatch) return Number(redMatch[1]);
-  const isWhite = s.includes('trang') || s.includes('white');
-  const isRed = s.includes('do') || s.includes('red');
-  if (isWhite && !isRed) count = 4 - count;
-  if (isRed || isWhite) return count;
-  // Chuỗi chỉ có số, không có màu: không tự đoán màu.
+  if (whiteMatch) return 4 - Number(whiteMatch[1]);
+  const wordMap = { zero: 0, one: 1, two: 2, three: 3, four: 4, mot: 1, hai: 2, ba: 3, bon: 4, khong: 0 };
+  for (const [word, number] of Object.entries(wordMap)) {
+    if (new RegExp(`\\b${word}\\s*(do|red)\\b`).test(s)) return number;
+    if (new RegExp(`\\b${word}\\s*(trang|white)\\b`).test(s)) return 4 - number;
+  }
+  // Chuỗi kiểu "3-1" chỉ được hiểu khi trường nguồn xác định rõ thứ tự đỏ-trắng.
+  const pair = s.match(/^([0-4])\s+([0-4])$/);
+  if (pair && Number(pair[1]) + Number(pair[2]) === 4) return Number(pair[1]);
   return null;
 }
 
@@ -401,30 +476,74 @@ function formatXocdia(redCount) {
   return `${redCount} đỏ - ${4 - redCount} trắng`;
 }
 
+function getXocdiaColorValues(row) {
+  if (!row || typeof row !== 'object') return [];
+  const raw = firstValue(row, [
+    'colors', 'Colors', 'coinColors', 'CoinColors', 'coins', 'Coins',
+    'discs', 'Discs', 'disks', 'Disks', 'colorList', 'ColorList',
+    'faces', 'Faces', 'facesList', 'FacesList', 'resultList', 'ResultList',
+    'dices', 'Dices', 'diceList', 'DiceList'
+  ]);
+  if (Array.isArray(raw)) return raw.map(value => {
+    if (value && typeof value === 'object') return firstValue(value, ['color', 'Color', 'value', 'Value', 'name', 'Name', 'result', 'Result']);
+    return value;
+  }).filter(value => value != null);
+  if (typeof raw === 'string') {
+    const matches = raw.match(/đỏ|trắng|do|trang|red|white|\br\b|\bw\b/giu);
+    if (matches && matches.length === 4) return matches;
+  }
+  return [];
+}
+
 function parseXocdiaRow(row) {
-  const rawDice = getDice(row);
-  const dice = rawDice.map(v => normalizeColor(v) || String(v));
-  const colors = rawDice.map(normalizeColor).filter(Boolean);
-  let redCount = rawDice.length === 4 && colors.length === 4 ? colors.filter(c => c === 'do').length : null;
-  const rawVi = firstValue(row, ['resultVi', 'ResultVi', 'vi', 'Vi', 'result_vi', 'pattern', 'Pattern']);
-  if (redCount === null) redCount = redCountFromVi(rawVi);
+  // Xóc Đĩa dùng bốn quân màu, không phải ba xúc xắc. Chỉ đọc màu/mẫu kết quả.
+  const rawPattern = firstValue(row, [
+    'resultVi', 'ResultVi', 'vi', 'Vi', 'result_vi', 'pattern', 'Pattern',
+    'ket_qua', 'Ket_qua', 'result', 'Result', 'outcome', 'Outcome',
+    'resultName', 'ResultName', 'name', 'Name'
+  ]);
+  let colorValues = getXocdiaColorValues(row);
+  if (!colorValues.length && Array.isArray(rawPattern)) colorValues = rawPattern;
+  if (!colorValues.length && typeof rawPattern === 'string') {
+    const tokens = normText(rawPattern).match(/\b(do|trang|red|white)\b/g);
+    if (tokens && tokens.length === 4) colorValues = tokens;
+  }
+  const colors = colorValues.map(normalizeColor);
+  let redCount = colorValues.length === 4 && colors.every(Boolean)
+    ? colors.filter(color => color === 'do').length : null;
+
+  // Một số API trả số lượng màu thay vì danh sách bốn quân.
+  if (redCount === null) {
+    const explicitRed = toNumber(firstValue(row, ['redCount', 'RedCount', 'soDo', 'SoDo', 'doCount', 'DoCount', 'red', 'Red']));
+    const explicitWhite = toNumber(firstValue(row, ['whiteCount', 'WhiteCount', 'soTrang', 'SoTrang', 'trangCount', 'TrangCount', 'white', 'White']));
+    if (Number.isInteger(explicitRed) && explicitRed >= 0 && explicitRed <= 4 &&
+        (explicitWhite === null || explicitWhite === 4 - explicitRed)) redCount = explicitRed;
+    else if (Number.isInteger(explicitWhite) && explicitWhite >= 0 && explicitWhite <= 4) redCount = 4 - explicitWhite;
+  }
+  if (redCount === null) redCount = redCountFromVi(rawPattern);
+
   const whiteCount = redCount === null ? null : 4 - redCount;
-  const declaredSide = parseKetQua(firstValue(row, [
-    'resultTruyenThong', 'ResultTruyenThong', 'ket_qua', 'Ket_qua', 'result', 'Result', 'side', 'Side'
-  ]));
+  const declaredValue = firstValue(row, [
+    'resultTruyenThong', 'ResultTruyenThong', 'ket_qua', 'Ket_qua',
+    'result', 'Result', 'side', 'Side', 'parity', 'Parity'
+  ]);
+  const declaredSide = parseKetQua(declaredValue) || parseKetQua(rawPattern);
   const derivedSide = redCount === null ? null : (redCount % 2 === 0 ? 'CHAN' : 'LE');
   const side = derivedSide || (declaredSide === 'CHAN' || declaredSide === 'LE' ? declaredSide : null);
+  const patternText = formatXocdia(redCount) || null;
   const dataWarning = derivedSide && (declaredSide === 'CHAN' || declaredSide === 'LE') && derivedSide !== declaredSide
-    ? `Kết quả API ${sideLabel(declaredSide)} lệch mẫu màu ${formatXocdia(redCount)}` : null;
+    ? `Kết quả API ${sideLabel(declaredSide)} lệch mẫu màu ${patternText}` : null;
   return {
     session: getSession(row),
     side,
     sideSource: derivedSide ? 'derived_color' : side ? 'declared' : 'missing',
     dataWarning,
-    dice,
+    // Không lưu quân màu trong trường xúc xắc; giữ riêng mẫu đỏ/trắng.
+    dice: [],
+    coins: colors.length === 4 && colors.every(Boolean) ? colors : [],
     doCount: redCount,
     trangCount: whiteCount,
-    vi: formatXocdia(redCount) || (rawVi == null ? null : String(rawVi)),
+    vi: patternText || (rawPattern != null && (declaredSide === 'CHAN' || declaredSide === 'LE') ? sideLabel(declaredSide) : null),
     time: normalizeTime(firstValue(row, ['time', 'Time', 'createdAt', 'CreatedAt', 'timestamp']))
   };
 }
@@ -448,12 +567,6 @@ function parseTxRow(row, timeKeys = []) {
     cau: firstValue(row, ['Cau_hien_tai', 'cau_hien_tai', 'currentCau', 'current_cau']) || null,
     apiSampleSize: toNumber(firstValue(row, ['Sample_size', 'sample_size', 'sampleSize']))
   };
-}
-
-function parseSunwinSicbo(raw) {
-  const list = getRows(raw && raw.data && raw.data.resultList ? raw.data.resultList : raw);
-  return list.map(row => parseTxRow(row, ['timeMilli', 'time', 'Time', 'createdAt']))
-    .filter(row => row.session);
 }
 
 function parseSunhot(raw) {
@@ -491,7 +604,6 @@ function parseHitclub(raw) {
 }
 
 const PARSERS = {
-  sunwinSicbo: parseSunwinSicbo,
   sunhot: parseSunhot,
   lc79List: parseLc79List,
   lc79Xocdia: parseLc79Xocdia,
@@ -514,7 +626,7 @@ function sourceSideQuality(row) {
   if (source === 'declared') return 1;
   if (source === 'embedded_cau' || source === 'missing') return 0;
   // Compatibility with source files saved by v1/v2 before sideSource was stored.
-  if (Array.isArray(row.dice) && (row.dice.length === 3 || row.dice.length === 4)) return 3;
+  if ((Array.isArray(row.dice) && row.dice.length === 3) || (Array.isArray(row.coins) && row.coins.length === 4)) return 3;
   if ((row.sum !== null && row.sum !== undefined && Number.isFinite(Number(row.sum))) ||
       (row.doCount !== null && row.doCount !== undefined && Number.isFinite(Number(row.doCount)))) return 2;
   return row.side ? 1 : 0;
@@ -792,12 +904,6 @@ const MODEL_PROFILES = {
     patternPrior: 7, runPrior: 8, sumBandPrior: 10, evalWindow: 58,
     weights: { short: 0.14, medium: 0.10, long: 0.06, ewma: 0.12, markov1: 0.11, markov2: 0.10, markov3: 0.08, pattern: 0.11, run: 0.07, sumBand: 0.03, dice: 0.06 }
   }),
-  'sunwin/sicbo': makeModelProfile('sunwin-sicbo-distribution', {
-    shortWindow: 16, mediumWindow: 48, longWindow: 110, ewmaAlpha: 0.08,
-    markovPriors: [10, 15, 20], patternMaxOrder: 5, patternMinMatches: 3,
-    patternPrior: 9, runPrior: 10, sumBandPrior: 12, evalWindow: 64,
-    weights: { short: 0.09, medium: 0.12, long: 0.11, ewma: 0.08, markov1: 0.12, markov2: 0.10, markov3: 0.06, pattern: 0.08, run: 0.07, sumBand: 0.05, dice: 0.10 }
-  }),
   'sunhot/tx': makeModelProfile('sunhot-tx-short-medium', {
     shortWindow: 12, mediumWindow: 38, longWindow: 90, ewmaAlpha: 0.10,
     markovPriors: [8, 13, 18], patternMaxOrder: 5, patternMinMatches: 3,
@@ -944,28 +1050,6 @@ function xocdiaPatternRanking(history, side) {
   })).sort((a, b) => b.probability - a.probability);
 }
 
-function sicboTopSums(history, side) {
-  const counts = {};
-  for (const row of history.slice(-180)) {
-    if (row.side === side && Number.isFinite(Number(row.sum))) {
-      const sum = Number(row.sum);
-      counts[sum] = (counts[sum] || 0) + 1;
-    }
-  }
-  const ways = {
-    3: 1, 4: 3, 5: 6, 6: 10, 7: 15, 8: 21, 9: 25,
-    10: 27, 11: 27, 12: 25, 13: 21, 14: 15, 15: 10, 16: 6, 17: 3, 18: 1
-  };
-  const candidates = [];
-  for (let sum = 3; sum <= 18; sum++) {
-    if (side === 'T' && sum < 11) continue;
-    if (side === 'X' && sum > 10) continue;
-    const score = (counts[sum] || 0) + (ways[sum] || 0) * 0.35;
-    candidates.push({ sum, score });
-  }
-  return candidates.sort((a, b) => b.score - a.score).slice(0, 3).map(x => x.sum);
-}
-
 class Engine {
   constructor(gameId, type) {
     this.id = gameId;
@@ -980,7 +1064,7 @@ class Engine {
       if (!row || !row.side) continue;
       bySession.set(String(row.session), {
         session: row.session, side: row.side, sum: toNumber(row.sum),
-        dice: Array.isArray(row.dice) ? row.dice : [], vi: row.vi || null,
+        dice: Array.isArray(row.dice) ? row.dice : [], coins: Array.isArray(row.coins) ? row.coins : [], vi: row.vi || null,
         doCount: Number.isInteger(row.doCount) ? row.doCount : redCountFromVi(row.vi),
         trangCount: Number.isInteger(row.trangCount) ? row.trangCount : null,
         time: row.time || null,
@@ -1076,7 +1160,6 @@ class Engine {
     if (!model) {
       return {
         side: 'T', label: 'Tài', conf: 50,
-        topSums: this.type === 'sicbo' ? [11, 12, 13] : [],
         lyDo: 'Chưa đủ dữ liệu lịch sử để chấm mô hình',
         cau: this.currentCau(20), sampleSize: this.history.length
       };
@@ -1086,7 +1169,6 @@ class Engine {
       label: sideLabel(model.side),
       conf: model.confidence,
       pSide: model.pT,
-      topSums: this.type === 'sicbo' ? sicboTopSums(this.history, model.side) : [],
       lyDo: model.lyDo,
       cau: this.currentCau(20),
       sampleSize: model.n,
@@ -1121,10 +1203,16 @@ function findSourceResult(rows, session) {
 }
 
 function actualDiceText(row, gameType) {
-  if (!row) return null;
-  if (gameType === 'xocdia') return row.vi || (Number.isInteger(row.doCount) ? formatXocdia(row.doCount) : null);
+  if (!row || gameType === 'xocdia') return null;
   if (Array.isArray(row.dice) && row.dice.length) return row.dice.join(' - ');
   return null;
+}
+
+function actualXocdiaText(row) {
+  if (!row) return null;
+  return row.vi && /do|trang/i.test(normText(row.vi))
+    ? row.vi
+    : (Number.isInteger(row.doCount) ? formatXocdia(row.doCount) : null);
 }
 
 function settlePredictionLogs(gameId, rows) {
@@ -1144,7 +1232,7 @@ function settlePredictionLogs(gameId, rows) {
         actual: 'Bộ ba', actual_side: null,
         actual_dice: actualDiceText(actualRow, game.type),
         actual_sum: actualRow.sum == null ? null : actualRow.sum,
-        actual_vi: game.type === 'xocdia' ? actualDiceText(actualRow, game.type) : null,
+        actual_vi: game.type === 'xocdia' ? actualXocdiaText(actualRow) : null,
         ok: null, void: true, data_warning: actualRow.dataWarning || null
       };
       const rowChanged = Object.keys(next).some(key => log[key] !== next[key]);
@@ -1159,7 +1247,7 @@ function settlePredictionLogs(gameId, rows) {
       actual: sideLabel(actualRow.side), actual_side: actualRow.side,
       actual_dice: actualDiceText(actualRow, game.type),
       actual_sum: actualRow.sum == null ? null : actualRow.sum,
-      actual_vi: game.type === 'xocdia' ? actualDiceText(actualRow, game.type) : null,
+      actual_vi: game.type === 'xocdia' ? actualXocdiaText(actualRow) : null,
       ok: predictedSide === actualRow.side, void: false,
       data_warning: actualRow.dataWarning || null
     };
@@ -1231,8 +1319,7 @@ function predictionFromLog(log, game) {
       lyDo: log.pause_reason || 'Tạm dừng bảo vệ sau chuỗi dự đoán sai',
       cau: log.cau || '',
       vi: null,
-      topVi: [],
-      topSums: []
+      topVi: []
     };
   }
   return {
@@ -1242,8 +1329,7 @@ function predictionFromLog(log, game) {
     lyDo: log.ly_do || 'Dự đoán đã lưu cho phiên này',
     cau: log.cau || '',
     vi: log.vi || null,
-    topVi: Array.isArray(log.top_vi) ? log.top_vi : [],
-    topSums: Array.isArray(log.top_sums) ? log.top_sums : []
+    topVi: Array.isArray(log.top_vi) ? log.top_vi : []
   };
 }
 
@@ -1314,26 +1400,33 @@ async function runPredictInternal(gameId) {
 
   const sampleCount = engine.validSampleCount();
   const basePayload = {
-    id: IDOL,
-    Name: game.label,
-    Phien: latest.session != null
+    ma: IDOL,
+    ten_game: game.label,
+    phien: latest.session != null
       ? (isNumericSession(latest.session) ? Number(latest.session) : latest.session)
       : null,
-    Xuc_xac: actualDiceText(latest, game.type),
-    Tong: latest.sum == null ? null : latest.sum,
-    Ket_qua: sideLabel(latest.side),
-    Cau_hien_tai: engine.currentCau(20),
-    Phien_tiep: isNumericSession(nextSession) ? Number(nextSession) : nextSession,
-    Time: nowVN(),
-    Data_warning: latest.dataWarning || null,
-    API_sample_size: latest.apiSampleSize || null,
-    Sample_size: sampleCount,
-    So_phien_toi_thieu: MIN_HISTORY_SESSIONS
+    ket_qua: gameSideLabel(latest.side, game.type),
+    chuoi_cau: currentRoadVietnamese(engine.history, game.type, 20),
+    phien_tiep: isNumericSession(nextSession) ? Number(nextSession) : nextSession,
+    thoi_gian: nowVN(),
+    canh_bao_du_lieu: latest.dataWarning || null,
+    so_mau_api: latest.apiSampleSize || null,
+    so_phien_du_lieu: sampleCount,
+    so_phien_toi_thieu: MIN_HISTORY_SESSIONS,
+    thong_ke: summarizeGameStats(gameId),
+    phan_tich_cau: analyzeRoad(engine.history, game.type)
   };
 
-  // Warm-up applies independently to every game. Existing persisted source
-  // sessions are reused; APIs that return only the current round accumulate
-  // distinct sessions through polling until five valid outcomes exist.
+  if (game.type === 'xocdia') {
+    basePayload.mau_ket_qua = actualXocdiaText(latest);
+    basePayload.so_do = Number.isInteger(latest.doCount) ? latest.doCount : null;
+    basePayload.so_trang = Number.isInteger(latest.trangCount) ? latest.trangCount : null;
+  } else {
+    basePayload.xuc_xac = actualDiceText(latest, game.type);
+    basePayload.tong = latest.sum == null ? null : latest.sum;
+  }
+
+  // Warm-up applies independently to every game.
   if (sampleCount < MIN_HISTORY_SESSIONS) {
     const remaining = MIN_HISTORY_SESSIONS - sampleCount;
     lastStatus[gameId] = {
@@ -1342,14 +1435,14 @@ async function runPredictInternal(gameId) {
     };
     return {
       ...basePayload,
-      Trang_thai: 'DANG_HOC_DU_LIEU',
-      Is_ready: false,
-      Con_thieu: remaining,
-      Du_doan: null,
-      Du_doan_side: null,
+      trang_thai: 'đang học dữ liệu',
+      san_sang: false,
+      con_thieu: remaining,
+      du_doan: null,
+      du_doan_cua: null,
       do_tin_cay: null,
-      Ly_do: `Đang thu thập dữ liệu riêng cho ${game.label}: đã có ${sampleCount}/${MIN_HISTORY_SESSIONS} phiên hợp lệ; chưa phát dự đoán`,
-      Model_profile: getModelProfile(gameId).name
+      ly_do: `Đang thu thập dữ liệu riêng cho ${game.label}: đã có ${sampleCount}/${MIN_HISTORY_SESSIONS} phiên hợp lệ; chưa phát dự đoán`,
+      thong_ke: summarizeGameStats(gameId)
     };
   }
 
@@ -1372,9 +1465,11 @@ async function runPredictInternal(gameId) {
         ly_do: reason,
         pause_reason: reason,
         cau: engine.currentCau(20),
+        vi: null,
         actual: null,
         actual_side: null,
         actual_dice: null,
+        actual_vi: null,
         ok: null,
         void: false,
         risk_pause: true,
@@ -1384,9 +1479,7 @@ async function runPredictInternal(gameId) {
       pred = predictionFromLog(log, game);
     } else {
       pred = engine.predict();
-      if (!pred || pred.ready === false) {
-        throw new Error('Dữ liệu chưa đủ để khởi tạo mô hình dự đoán');
-      }
+      if (!pred || pred.ready === false) throw new Error('Dữ liệu chưa đủ để khởi tạo mô hình dự đoán');
       log = pushPredLog(gameId, {
         phien: nextSession,
         du_doan: pred.label,
@@ -1396,12 +1489,12 @@ async function runPredictInternal(gameId) {
         cau: pred.cau || null,
         vi: pred.vi || null,
         top_vi: pred.topVi || [],
-        top_sums: pred.topSums || [],
         model_profile: pred.profile || getModelProfile(gameId).name,
         training_sample_size: pred.sampleSize || sampleCount,
         actual: null,
         actual_side: null,
         actual_dice: null,
+        actual_vi: null,
         ok: null,
         time: nowVN()
       });
@@ -1410,25 +1503,26 @@ async function runPredictInternal(gameId) {
 
   const payload = {
     ...basePayload,
-    Cau_hien_tai: pred.cau || engine.currentCau(20),
-    Du_doan: pred.paused ? null : pred.label,
-    Du_doan_side: pred.paused ? null : pred.side,
+    chuoi_cau: currentRoadVietnamese(engine.history, game.type, 20),
+    du_doan: pred.paused ? null : pred.label,
+    du_doan_cua: pred.paused ? null : gameSideLabel(pred.side, game.type),
     do_tin_cay: pred.paused ? null : pred.conf,
-    Ly_do: pred.lyDo || 'Tổng hợp thống kê lịch sử riêng của game',
-    Sample_size: pred.sampleSize || sampleCount,
-    Model_profile: log.model_profile || getModelProfile(gameId).name,
-    Consecutive_losses: pred.paused ? (log.loss_streak_before_pause || 3) : consecutiveLossState(gameId, nextSession).count,
-    Trang_thai: pred.paused ? 'TAM_DUNG_BAO_VE' : 'DA_SAN_SANG',
-    Is_ready: true,
-    Con_thieu: 0
+    ly_do: pred.lyDo || 'Tổng hợp thống kê lịch sử riêng của game',
+    so_phien_phan_tich: pred.sampleSize || sampleCount,
+    so_lan_sai_lien_tiep: pred.paused ? (log.loss_streak_before_pause || 3) : consecutiveLossState(gameId, nextSession).count,
+    trang_thai: pred.paused ? 'tạm dừng bảo vệ' : 'đã sẵn sàng',
+    san_sang: true,
+    con_thieu: 0,
+    thong_ke: summarizeGameStats(gameId)
   };
 
-  if (game.type === 'sicbo' && !pred.paused) payload.Ba_tong_de_ra = pred.topSums || [];
   if (game.type === 'xocdia') {
-    payload.Vi = pred.paused ? null : (pred.vi || null);
-    payload.Top_vi = pred.paused ? [] : (pred.topVi || []);
-    payload.Top_vi_chi_tiet = pred.paused ? [] : (pred.viDetails || []);
-    payload.Du_doan_vi = pred.paused ? null : (pred.vi || null);
+    payload.vi_du_doan = pred.paused ? null : (pred.vi || null);
+    payload.top_mau_du_doan = pred.paused ? [] : (pred.topVi || []);
+    payload.top_mau_chi_tiet = pred.paused ? [] : (pred.viDetails || []).map(item => ({
+      mau: item.vi,
+      xac_suat_phan_tram: item.probability
+    }));
   }
 
   lastStatus[gameId] = {
@@ -1475,142 +1569,133 @@ function startPolling() {
   if (pollTimer.unref) pollTimer.unref();
 }
 
+function formatHistoryRow(entry, game) {
+  const phien = entry.phien != null ? String(entry.phien) : '—';
+  if (entry.risk_pause === true) return `${phien} · tạm nghỉ · ⏸️`;
+  const mark = entry.void === true ? '➖' : entry.ok === true ? '✅' : entry.ok === false ? '❌' : '⏳';
+  const actual = entry.actual || 'đang chờ';
+  if (game.type === 'xocdia') {
+    const pattern = entry.actual_vi && /do|trang/i.test(normText(entry.actual_vi)) ? entry.actual_vi : null;
+    const result = pattern ? `${pattern} · ${actual}` : actual;
+    return `${phien} · ${result} · ${mark}`;
+  }
+  const dice = entry.actual_dice ? ` · ${String(entry.actual_dice).replace(/\s*-\s*/g, '-')}` : '';
+  const sum = entry.actual_sum != null ? ` (${entry.actual_sum})` : '';
+  return `${phien}${dice} · ${actual}${sum} · ${mark}`;
+}
+
 /* ================================= ROUTES ================================ */
+function buildGameOverview(id, game) {
+  const status = lastStatus[id] || {};
+  return {
+    ma_game: id,
+    ten_game: game.label,
+    loai_game: game.type === 'xocdia' ? 'xóc đĩa' : 'tài xỉu',
+    trang_thai: vietnameseGameStatus(id),
+    so_phien_du_lieu: status.samples || getEngine(id).validSampleCount(),
+    so_phien_toi_thieu: status.required || MIN_HISTORY_SESSIONS,
+    thong_ke: summarizeGameStats(id),
+    cap_nhat_luc: status.time || null,
+    loi: status.error || null,
+    duong_dan_du_doan: `/${id}`,
+    duong_dan_lich_su: `/${id}/history`
+  };
+}
+
 app.get('/', (_req, res) => {
-  const games = Object.entries(GAMES).map(([id, game]) => {
-    const status = lastStatus[id] || { ok: null, error: null, time: null };
-    return {
-      id: IDOL,
-      game: id,
-      name: game.label,
-      type: game.type,
-      status: status.ok === true
-        ? (status.mode === 'protected' ? 'protected' : 'online')
-        : status.ok === false ? 'error' : status.mode === 'learning' ? 'learning' : 'pending',
-      sample_size: status.samples || 0,
-      required_samples: status.required || MIN_HISTORY_SESSIONS,
-      error: status.error || null,
-      last_update: status.time,
-      predict: `/${id}`,
-      history: `/${id}/history`
-    };
-  });
-  const online = games.filter(game => game.status === 'online').length;
+  const games = Object.entries(GAMES).map(([id, game]) => buildGameOverview(id, game));
+  const count = status => games.filter(game => game.trang_thai === status).length;
   res.json({
-    id: IDOL, name: 'PRED-API', version: '4.0.0', time: nowVN(),
-    total_games: games.length, online,
-    learning: games.filter(game => game.status === 'learning').length,
-    protected: games.filter(game => game.status === 'protected').length,
-    offline: games.filter(game => game.status === 'error').length, games
+    ma: IDOL,
+    ten: 'PRED-API',
+    phien_ban: '5.0.0',
+    thoi_gian: nowVN(),
+    tong_so_game: games.length,
+    dang_hoat_dong: count('đang hoạt động'),
+    dang_hoc_du_lieu: count('đang học dữ liệu'),
+    tam_dung_bao_ve: count('tạm dừng bảo vệ'),
+    mat_ket_noi: count('mất kết nối'),
+    cac_game: games
   });
 });
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, id: IDOL, version: '4.0.0', time: nowVN(), games: Object.keys(GAMES).length, min_history_sessions: MIN_HISTORY_SESSIONS });
+  res.json({
+    hoat_dong: true,
+    ma: IDOL,
+    phien_ban: '5.0.0',
+    thoi_gian: nowVN(),
+    tong_so_game: Object.keys(GAMES).length,
+    so_phien_toi_thieu: MIN_HISTORY_SESSIONS
+  });
 });
 
 app.get('/games', (_req, res) => {
-  const list = Object.entries(GAMES).map(([id, game]) => ({
-    id: IDOL,
-    game: id,
-    label: game.label,
-    type: game.type,
-    predict: `/${id}`,
-    history: `/${id}/history`,
-    status: lastStatus[id] && lastStatus[id].ok === true
-      ? (lastStatus[id].mode === 'protected' ? 'protected' : 'online')
-      : lastStatus[id] && lastStatus[id].ok === false ? 'error'
-        : lastStatus[id] && lastStatus[id].mode === 'learning' ? 'learning' : 'pending',
-    sample_size: lastStatus[id] && lastStatus[id].samples || 0,
-    required_samples: MIN_HISTORY_SESSIONS
-  }));
-  res.json({ id: IDOL, ok: true, total: list.length, min_history_sessions: MIN_HISTORY_SESSIONS, games: list });
+  const games = Object.entries(GAMES).map(([id, game]) => buildGameOverview(id, game));
+  res.json({
+    ma: IDOL,
+    thanh_cong: true,
+    tong_so_game: games.length,
+    so_phien_toi_thieu: MIN_HISTORY_SESSIONS,
+    cac_game: games
+  });
 });
-
-function formatHistoryRow(entry, game) {
-  const phien = entry.phien != null ? String(entry.phien) : '—';
-  if (entry.risk_pause === true) {
-    return `Phiên ${phien} | TẠM DỪNG BẢO VỆ: ${entry.pause_reason || 'nghỉ 1 phiên sau chuỗi sai'} | ⏸️`;
-  }
-  const prediction = entry.du_doan || '—';
-  const mark = entry.void === true ? '➖' : entry.ok === true ? '✅' : entry.ok === false ? '❌' : '⏳';
-  const actual = entry.actual || 'Đang chờ';
-  const dice = entry.actual_dice ? ` | KQ xúc xắc: ${entry.actual_dice}` : '';
-  const sum = entry.actual_sum != null && game.type !== 'xocdia' ? ` (${entry.actual_sum})` : '';
-  const conf = entry.conf != null ? ` | ${entry.conf}%` : '';
-  return `Phiên ${phien}${dice} | KQ: ${actual}${sum} | Dự đoán: ${prediction} | ${mark}${conf}`;
-}
 
 app.get('/:brand/:table/history', async (req, res) => {
   const gameId = `${req.params.brand}/${req.params.table}`;
   const game = GAMES[gameId];
-  if (!game) return res.status(404).json({ ok: false, error: 'Game không tồn tại' });
+  if (!game) return res.status(404).json({ thanh_cong: false, loi: 'Game không tồn tại' });
   let refreshError = null;
   try {
-    // Gọi cùng luồng cập nhật có khóa inFlight: không nhân đôi request khi poll đang chạy.
     await runPredict(gameId);
   } catch (error) {
     refreshError = error.message;
   }
+
   const logs = (Array.isArray(predHistory[gameId]) ? predHistory[gameId] : []).slice(0, PRED_LIMIT);
-  let correct = 0;
-  let wrong = 0;
-  let waiting = 0;
-  let voided = 0;
-  let paused = 0;
-  for (const entry of logs) {
-    if (entry.risk_pause === true) paused++;
-    else if (entry.ok === true) correct++;
-    else if (entry.ok === false) wrong++;
-    else if (entry.void === true) voided++;
-    else waiting++;
-  }
-  const settled = correct + wrong;
-  const items = logs.map(entry => ({
-    phien: entry.phien,
-    du_doan: entry.du_doan || null,
-    du_doan_side: entry.pred_side || getPredictionSide(entry.du_doan),
-    ket_qua: entry.actual || null,
-    ket_qua_side: entry.actual_side || null,
-    xuc_xac: entry.actual_dice || null,
-    tong: entry.actual_sum == null ? null : entry.actual_sum,
-    vi: entry.actual_vi || null,
-    dung: entry.ok === true,
-    sai: entry.ok === false,
-    bo_qua: entry.void === true,
-    tam_dung: entry.risk_pause === true,
-    trang_thai: entry.risk_pause === true ? 'tạm dừng bảo vệ' : entry.void === true ? 'bỏ qua (bộ ba)' : entry.ok === true ? 'đúng' : entry.ok === false ? 'sai' : 'đang chờ',
-    icon: entry.risk_pause === true ? '⏸️' : entry.void === true ? '➖' : entry.ok === true ? '✅' : entry.ok === false ? '❌' : '⏳',
-    canh_bao_du_lieu: entry.data_warning || null,
-    do_tin_cay: entry.conf == null ? null : entry.conf,
-    thoi_gian_du_doan: entry.time || null,
-    thoi_gian_ket_qua: entry.result_time || null
-  }));
+  const items = logs.map(entry => {
+    const item = {
+      phien: entry.phien,
+      ket_qua: entry.actual || null,
+      dung: entry.ok === true,
+      sai: entry.ok === false,
+      bo_qua: entry.void === true,
+      tam_dung: entry.risk_pause === true,
+      trang_thai: entry.risk_pause === true ? 'tạm dừng' : entry.void === true ? 'bỏ qua' : entry.ok === true ? 'đúng' : entry.ok === false ? 'sai' : 'đang chờ',
+      bieu_tuong: entry.risk_pause === true ? '⏸️' : entry.void === true ? '➖' : entry.ok === true ? '✅' : entry.ok === false ? '❌' : '⏳'
+    };
+    if (game.type === 'xocdia') {
+      item.mau_ket_qua = entry.actual_vi || null;
+    } else {
+      item.xuc_xac = entry.actual_dice || null;
+      item.tong = entry.actual_sum == null ? null : entry.actual_sum;
+    }
+    return item;
+  });
+
+  const stats = summarizeGameStats(gameId);
   res.json({
-    id: IDOL,
-    ok: true,
-    game: gameId,
-    total: logs.length,
-    dung: correct,
-    sai: wrong,
-    cho: waiting,
-    bo_qua: voided,
-    tam_dung: paused,
-    learning_ready: (getEngine(gameId).validSampleCount() >= MIN_HISTORY_SESSIONS),
-    learning_sessions: getEngine(gameId).validSampleCount(),
-    required_learning_sessions: MIN_HISTORY_SESSIONS,
-    ti_le: settled ? Math.round((correct / settled) * 100) : 0,
-    refresh_error: refreshError,
-    updated_at: nowVN(),
-    items,
-    history: logs.map(entry => formatHistoryRow(entry, game))
+    ma: IDOL,
+    thanh_cong: true,
+    ten_game: game.label,
+    ma_game: gameId,
+    thong_ke: stats,
+    san_sang_hoc: getEngine(gameId).validSampleCount() >= MIN_HISTORY_SESSIONS,
+    so_phien_da_hoc: getEngine(gameId).validSampleCount(),
+    so_phien_toi_thieu: MIN_HISTORY_SESSIONS,
+    loi_lam_moi: refreshError,
+    cap_nhat_luc: nowVN(),
+    tong_dong_lich_su: items.length,
+    cac_phien: items,
+    // Dòng ngắn, không chứa dự đoán; phù hợp hiển thị nhỏ gọn trên một màn hình.
+    lich_su: logs.map(entry => formatHistoryRow(entry, game))
   });
 });
 
 app.get('/:brand/:table', async (req, res) => {
   const gameId = `${req.params.brand}/${req.params.table}`;
   if (!GAMES[gameId]) {
-    return res.status(404).json({ ok: false, error: 'Game không tồn tại', tip: 'Xem GET / hoặc GET /games' });
+    return res.status(404).json({ thanh_cong: false, loi: 'Game không tồn tại', goi_y: 'Xem GET / hoặc GET /games' });
   }
   try {
     const data = await runPredict(gameId);
@@ -1618,12 +1703,12 @@ app.get('/:brand/:table', async (req, res) => {
   } catch (error) {
     console.error('[PREDICT]', gameId, error.message);
     res.status(502).json({
-      id: IDOL,
-      ok: false,
-      game: gameId,
-      error: 'Không lấy được dữ liệu nguồn',
-      detail: error.message,
-      Time: nowVN()
+      ma: IDOL,
+      thanh_cong: false,
+      ma_game: gameId,
+      loi: 'Không lấy được dữ liệu nguồn',
+      chi_tiet: error.message,
+      thoi_gian: nowVN()
     });
   }
 });
@@ -1632,7 +1717,7 @@ app.get('/:brand/:table', async (req, res) => {
 let server = null;
 if (require.main === module) {
   server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`PRED-API v4.0 on :${PORT}`);
+    console.log(`PRED-API v5.0 on :${PORT}`);
     console.log('Polling:', POLL_MS, 'ms');
     console.log('Games:', Object.keys(GAMES).join(', '));
   });
@@ -1642,10 +1727,11 @@ if (require.main === module) {
 module.exports = {
   app, GAMES, PARSERS, Engine, mergeSourceHistory,
   parseLc79List, parseLc79Xocdia, parseHitclub, parseMax789,
-  parseSunwinSicbo, parseSunhot, modelProbability, MODEL_PROFILES, getModelProfile,
+  parseSunhot, modelProbability, MODEL_PROFILES, getModelProfile,
   formatXocdia, redCountFromVi, sideLabel, sideFromSum,
   getSum, resolveTxOutcome,
   settlePredictionLogs, pushPredLog, formatHistoryRow, fetchGame, runPredict, expandEmbeddedCauRows,
+  summarizeGameStats, analyzeRoad, actualXocdiaText, currentRoadVietnamese,
   consecutiveLossState,
   _state: { engines, predHistory, lastStatus }
 };
