@@ -608,3 +608,55 @@ test('Capital Vietnamese colour Đỏ is recognised (Xóc Đĩa sides are not dr
   assert.equal(bySession['13'].doCount, 0);
   assert.equal(bySession['13'].side, 'CHAN');
 });
+
+/* ===================== New tests for advanced cầu analysis ===================== */
+test('analyzeCauStructure detects long bệt', () => {
+  const sides = ['X','X','T','T','T','T','T','T','T'];
+  const info = api.analyzeCauStructure(sides);
+  assert.equal(info.regime, 'BET');
+  assert.equal(info.run, 7);
+  assert.ok(info.stability >= 0.7);
+});
+
+test('analyzeCauStructure detects 1-1 đảo', () => {
+  const sides = ['T','X','T','X','T','X','T','X','T','X'];
+  const info = api.analyzeCauStructure(sides);
+  assert.equal(info.regime, 'DAO_11');
+  assert.ok(info.stability >= 0.9);
+});
+
+test('analyzeCauStructure detects cycle period 2', () => {
+  const sides = ['T','X','T','X','T','X','T','X','T','X','T','X'];
+  const info = api.analyzeCauStructure(sides);
+  // Can be DAO_11 or CYCLE depending on order of checks
+  assert.ok(info.regime === 'DAO_11' || (info.regime === 'CYCLE' && info.cycle && info.cycle.period === 2));
+});
+
+test('analyzeCauStructure marks mixed / high switch', () => {
+  const sides = ['T','X','T','T','X','T','X','X','T','X','T','X','T'];
+  const info = api.analyzeCauStructure(sides);
+  assert.ok(['MIXED', 'CUM', 'DAO_11', 'BET'].includes(info.regime));
+  assert.ok(typeof info.switchRate === 'number');
+  assert.ok(typeof info.entropy === 'number');
+});
+
+test('modelProbability exposes regime and cauStructure', () => {
+  const history = [];
+  for (let i = 0; i < 30; i++) {
+    history.push({ session: String(1000 + i), side: i % 2 === 0 ? 'T' : 'X', sum: 10 + (i % 5), dice: [1, 2, 3 + (i % 3)] });
+  }
+  const model = api.modelProbability(history, 'tx', 'lc79/tx');
+  assert.ok(model);
+  assert.ok(model.regime);
+  assert.ok(model.cauStructure);
+  assert.ok(model.cauStructure.description);
+});
+
+test('MAX789 profile remains independent and unchanged in structure', () => {
+  const p = api.getModelProfile('max789/tx');
+  assert.equal(p.name, 'max789-tx-longer-context');
+  assert.equal(p.shortWindow, 18);
+  assert.equal(p.mediumWindow, 48);
+  assert.equal(p.longWindow, 112);
+  assert.ok(p.weights.markov1 >= 0.12);
+});
