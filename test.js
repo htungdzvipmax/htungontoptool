@@ -30,7 +30,7 @@ Module._load = function(request, parent, isMain) {
   return originalLoad.call(this, request, parent, isMain);
 };
 
-const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pred-api-v5-test-'));
+const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pred-api-v3-test-'));
 process.env.DATA_DIR = testDataDir;
 const api = require('./server');
 
@@ -62,7 +62,7 @@ test('MAX789 MD5: sample total 13 with declared Xỉu is corrected to Tài', () 
   assert.equal(row.side, 'T');
   assert.equal(row.sideSource, 'dice_sum');
   assert.equal(row.nextSession, 1919917);
-  assert.match(row.dataWarning, /Kết quả từ API là Xỉu/);
+  assert.match(row.dataWarning, /Ket_qua API Xỉu lệch/);
   assert.equal(row.time, '2026-11-26T04:58:06.000Z');
   assert.equal(row.apiSampleSize, 100);
 });
@@ -73,8 +73,8 @@ test('Dice sum wins over a conflicting reported total', () => {
   }] })[0];
   assert.equal(row.sum, 6);
   assert.equal(row.side, 'X');
-  assert.match(row.dataWarning, /Tổng từ API 13 lệch tổng xúc xắc 6/);
-  assert.match(row.dataWarning, /Kết quả từ API là Tài/);
+  assert.match(row.dataWarning, /Tong API 13 lệch tổng xúc xắc 6/);
+  assert.match(row.dataWarning, /Ket_qua API Tài lệch/);
 });
 
 test('A three-dice triple is not silently classified as Tài or Xỉu', () => {
@@ -111,14 +111,8 @@ test('Xocdia parser converts patterns to Vietnamese', () => {
   assert.equal(api.redCountFromVi('four_trang'), 0);
   assert.equal(api.redCountFromVi('one_trang'), 3);
   assert.equal(api.redCountFromVi('3 đỏ - 1 trắng'), 3);
-});
-
-test('Sunhot one-result API response is parsed with next session', () => {
-  const rows = api.parseSunhot({ phien_truoc: '55', phien_hien_tai: '56', ket_qua: 'Xỉu' });
-  assert.equal(rows.length, 1);
-  assert.equal(rows[0].session, '55');
-  assert.equal(rows[0].nextSession, '56');
-  assert.equal(rows[0].side, 'X');
+  const unknown = api.parseLc79Xocdia({ list: [{ id: '22', resultVi: 'odd_red_pattern' }] })[0];
+  assert.equal(unknown.vi, null);
 });
 
 test('MAX789 and Hitclub parsers support nested source JSON', () => {
@@ -166,7 +160,7 @@ test('Settled prediction is recalculated when source result is corrected', () =>
   }];
   api.settlePredictionLogs('max789/md5', [{
     session: '1919916', side: 'T', sideSource: 'dice_sum',
-    sum: 13, dice: [5, 2, 6], dataWarning: 'Kết quả từ API là Xỉu nhưng tính từ xúc xắc ra Tài'
+    sum: 13, dice: [5, 2, 6], dataWarning: 'Ket_qua API Xỉu lệch kết quả tính từ xúc xắc Tài'
   }]);
   const row = api._state.predHistory['max789/md5'][0];
   assert.equal(row.actual, 'Tài');
@@ -174,17 +168,40 @@ test('Settled prediction is recalculated when source result is corrected', () =>
   assert.equal(row.actual_dice, '5 - 2 - 6');
   assert.equal(row.actual_sum, 13);
   assert.equal(row.ok, true);
-  assert.match(row.data_warning, /Kết quả từ API/);
+  assert.match(row.data_warning, /Ket_qua API/);
 });
 
-test('History display is one compact result-only line with no prediction', () => {
+test('History display includes session, dice, result and status icon', () => {
   const row = {
     phien: '500', du_doan: 'Tài', actual: 'Tài', actual_side: 'T',
     actual_dice: '5 - 2 - 6', actual_sum: 13, ok: true, conf: 58
   };
   const formatted = api.formatHistoryRow(row, api.GAMES['max789/md5']);
-  assert.match(formatted, /^500 · 5-2-6 · Tài \(13\) · ✅$/);
-  assert.doesNotMatch(formatted, /Dự đoán/);
+  assert.match(formatted, /Phiên 500/);
+  assert.match(formatted, /5 - 2 - 6/);
+  assert.match(formatted, /Tài/);
+  assert.match(formatted, /✅/);
+});
+
+test('Compact history row contains only session, actual result and verdict icon', () => {
+  const tx = api.formatCompactHistoryRow({
+    phien: '2992', actual: 'Tài', actual_dice: '6 - 4 - 2',
+    actual_sum: 12, du_doan: 'Xỉu', ly_do: 'internal only', conf: 55, ok: false
+  }, api.GAMES['lc79/tx']);
+  assert.deepEqual(tx, {
+    phien: 2992, d1: 6, d2: 4, d3: 2, ket_qua: 'Tài', icon: '❌'
+  });
+  const xocdia = api.formatCompactHistoryRow({
+    phien: '2991', actual: 'Lẻ', actual_vi: '3 đỏ - 1 trắng',
+    actual_dice: null, actual_sum: null, ok: true
+  }, api.GAMES['lc79/xocdia']);
+  assert.deepEqual(xocdia, {
+    phien: 2991, ket_qua: '3 đỏ - 1 trắng', icon: '✅'
+  });
+  const pending = api.formatCompactHistoryRow({ phien: '2993', actual: null, ok: null }, api.GAMES['lc79/tx']);
+  assert.equal(pending, null);
+  const paused = api.formatCompactHistoryRow({ phien: '2994', risk_pause: true }, api.GAMES['lc79/tx']);
+  assert.equal(paused, null);
 });
 
 test('Prediction remains stable for an already-created target session', () => {
@@ -249,19 +266,80 @@ test('History endpoint refreshes API data and settles the exact pending session'
   const res = { statusCode: 200, status(code) { this.statusCode = code; return this; }, json(body) { responseBody = body; return this; } };
   await handler({ params: { brand: 'max789', table: 'md5' } }, res);
   assert.equal(res.statusCode, 200);
-  assert.equal(responseBody.thanh_cong, true);
-  const settled = responseBody.cac_phien.find(item => String(item.phien) === '1919916');
+  assert.deepEqual(Object.keys(responseBody), ['history']);
+  const settled = responseBody.history.find(item => String(item.phien) === '1919916');
   assert.ok(settled);
   assert.equal(settled.ket_qua, 'Tài');
-  assert.equal(settled.xuc_xac, '5 - 2 - 6');
-  assert.equal(settled.bieu_tuong, '✅');
-  const embeddedSettled = responseBody.cac_phien.find(item => String(item.phien) === '1919915');
+  assert.deepEqual([settled.d1, settled.d2, settled.d3], [5, 2, 6]);
+  assert.equal(settled.icon, '✅');
+  const embeddedSettled = responseBody.history.find(item => String(item.phien) === '1919915');
   assert.ok(embeddedSettled);
   assert.equal(embeddedSettled.ket_qua, 'Tài');
-  assert.equal(embeddedSettled.bieu_tuong, '✅');
-  assert.equal(responseBody.loi_lam_moi, null);
-  assert.ok(responseBody.lich_su.every(line => !/Dự đoán/.test(line)));
+  assert.equal(embeddedSettled.icon, '✅');
+  assert.equal('du_doan' in settled, false);
+  assert.equal('ly_do' in settled, false);
+  assert.equal('conf' in settled, false);
+  assert.equal('items' in responseBody, false);
   axiosState.data = null;
+});
+
+test('Root dashboard exposes per-game stats and excludes Sunhot/Sunwin Sicbo', () => {
+  api._state.predHistory['lc79/tx'] = [
+    { phien: '3', ok: true, actual: 'Tài' },
+    { phien: '2', ok: false, actual: 'Xỉu' },
+    { phien: '1', ok: null, actual: null }
+  ];
+  const overview = api.buildOverview();
+  assert.equal(overview.games.some(game => game.game === 'sunhot/tx' || game.game === 'sunwin/sicbo'), false);
+  const lc79 = overview.games.find(game => game.game === 'lc79/tx');
+  assert.deepEqual(lc79.thong_ke, {
+    tong_phien: 3, dung: 1, sai: 1, dang_cho: 1,
+    tam_dung: 0, bo_qua: 0, ti_le_dung: 50, ti_le: '50%'
+  });
+  assert.match(api.DASHBOARD_HTML, /Danh sách game/);
+  assert.match(api.DASHBOARD_HTML, /Tỉ lệ đúng/);
+});
+
+test('Browser root returns a dashboard while API clients retain JSON overview', () => {
+  const root = registeredRoutes.get('GET /');
+  let html = '';
+  const htmlRes = {
+    type(value) { this.contentType = value; return this; },
+    send(value) { html = value; return this; },
+    json() { throw new Error('expected HTML response'); }
+  };
+  root({ headers: { accept: 'text/html,application/xhtml+xml' } }, htmlRes);
+  assert.equal(htmlRes.contentType, 'html');
+  assert.match(html, /PRED-API/);
+
+  let json = null;
+  const jsonRes = { json(value) { json = value; return this; } };
+  root({ headers: { accept: 'application/json' } }, jsonRes);
+  assert.equal(json.name, 'PRED-API');
+  assert.ok(Array.isArray(json.games));
+});
+
+test('/overview endpoint returns the same per-game statistics JSON used by the dashboard', () => {
+  const handler = registeredRoutes.get('GET /overview');
+  let body = null;
+  handler({}, { json(value) { body = value; return this; } });
+  assert.ok(Array.isArray(body.games));
+  const lc79 = body.games.find(game => game.game === 'lc79/tx');
+  assert.equal(lc79.thong_ke.dung, 1);
+  assert.equal(lc79.thong_ke.sai, 1);
+  assert.equal(lc79.thong_ke.ti_le, '50%');
+});
+
+test('Xoc Dia public cầu sequence is written as Vietnamese labels', () => {
+  assert.equal(api.formatCauForApi('CLLCCL', 'xocdia'), 'Chẵn → Lẻ → Lẻ → Chẵn → Chẵn → Lẻ');
+  assert.equal(api.formatCauForApi('TXTXT', 'tx'), 'TXTXT');
+});
+
+test('Retired Sunhot and Sunwin Sicbo endpoints are no longer registered as games', () => {
+  assert.equal(Object.hasOwn(api.GAMES, 'sunhot/tx'), false);
+  assert.equal(Object.hasOwn(api.GAMES, 'sunwin/sicbo'), false);
+  assert.equal(Object.hasOwn(api.PARSERS, 'sunhot'), false);
+  assert.equal(Object.hasOwn(api.PARSERS, 'sunwinSicbo'), false);
 });
 
 test('Xocdia prediction provides Vietnamese red-white pattern labels', () => {
@@ -277,53 +355,79 @@ test('Xocdia prediction provides Vietnamese red-white pattern labels', () => {
   engine.loadHistory([...history].reverse());
   const prediction = engine.predict();
   assert.ok(['Chẵn', 'Lẻ'].includes(prediction.label));
+  assert.ok(['3 đỏ - 1 trắng', '2 đỏ - 2 trắng', '1 đỏ - 3 trắng', '4 đỏ - 0 trắng', '0 đỏ - 4 trắng'].includes(prediction.vi));
+  assert.ok(['Chẵn', 'Lẻ'].includes(api.sideLabel(prediction.side)));
   assert.match(prediction.vi, /đỏ - .*trắng/);
   assert.ok(prediction.topVi.every(value => /đỏ - .*trắng/.test(value)));
+});
+
+test('Live Xoc Dia JSON is fully Vietnamese and does not expose dice or total fields', async () => {
+  axiosState.data = { list: [
+    { id: 105, dices: ['đỏ', 'đỏ', 'trắng', 'trắng'] },
+    { id: 104, dices: ['đỏ', 'trắng', 'trắng', 'trắng'] },
+    { id: 103, dices: ['đỏ', 'đỏ', 'đỏ', 'trắng'] },
+    { id: 102, dices: ['trắng', 'trắng', 'trắng', 'trắng'] },
+    { id: 101, dices: ['đỏ', 'đỏ', 'đỏ', 'đỏ'] }
+  ] };
+  const result = await api.runPredict('lc79/xocdia');
+  assert.equal(Object.hasOwn(result, 'Xuc_xac'), false);
+  assert.equal(Object.hasOwn(result, 'Tong'), false);
+  assert.equal(result.Ket_qua, '2 đỏ - 2 trắng');
+  assert.equal(result.Chan_le, 'Chẵn');
+  assert.ok(['Chẵn', 'Lẻ'].includes(result.Du_doan));
+  assert.ok(['Chẵn', 'Lẻ'].includes(result.Du_doan_side));
+  assert.match(result.Vi, /đỏ - .*trắng/);
+  assert.match(result.Du_doan_vi, /đỏ - .*trắng/);
+  assert.ok(result.Top_vi.every(value => /đỏ - .*trắng/.test(value)));
+  assert.ok(result.Top_vi_chi_tiet.every(item => Object.hasOwn(item, 'ti_le') && !Object.hasOwn(item, 'probability')));
+  assert.ok(result.Cau_hien_tai.includes('Chẵn') || result.Cau_hien_tai.includes('Lẻ'));
+  axiosState.data = null;
 });
 
 test('Every game has an independent model profile (not the LC79 profile reused)', () => {
   const ids = Object.keys(api.GAMES);
   for (const id of ids) assert.ok(api.MODEL_PROFILES[id], `Missing profile for ${id}`);
   assert.notEqual(api.getModelProfile('lc79/tx').name, api.getModelProfile('max789/md5').name);
-  assert.ok(!ids.includes('sunwin/sicbo'));
-  assert.notEqual(api.getModelProfile('lc79/tx').shortWindow, api.getModelProfile('hitclub/tx').shortWindow);
+  assert.equal(ids.some(id => id.startsWith('sunhot/') || id.startsWith('sunwin/')), false);
   assert.notEqual(api.getModelProfile('lc79/md5').weights.pattern, api.getModelProfile('max789/md5').weights.pattern);
 });
 
 test('A game with fewer than five source sessions remains in warm-up and emits no fake forecast', async () => {
-  api._state.predHistory['sunhot/tx'] = [];
+  api._state.predHistory['max789/kubet'] = [];
   let result;
   // This simulates a provider that exposes only the current result, not a history array.
   for (let session = 101; session <= 104; session++) {
     axiosState.data = {
-      phien_truoc: String(session),
-      phien_hien_tai: String(session + 1),
-      ket_qua: session % 2 ? 'Tài' : 'Xỉu'
+      Phien: session,
+      Phien_tiep: session + 1,
+      Xuc_xac: session % 2 ? '2 - 3 - 4' : '1 - 2 - 3',
+      Tong: session % 2 ? 9 : 6,
+      Ket_qua: session % 2 ? 'Xỉu' : 'Xỉu'
     };
-    result = await api.runPredict('sunhot/tx');
-    assert.equal(result.trang_thai, 'đang học dữ liệu');
-    assert.equal(result.so_phien_du_lieu, session - 100);
-    assert.equal(result.du_doan, null);
+    result = await api.runPredict('max789/kubet');
+    assert.equal(result.Trang_thai, 'DANG_HOC_DU_LIEU');
+    assert.equal(result.Sample_size, session - 100);
+    assert.equal(result.Du_doan, null);
   }
-  assert.equal(result.san_sang, false);
-  assert.equal(result.so_phien_du_lieu, 4);
-  assert.equal(result.con_thieu, 1);
-  assert.equal(result.du_doan_cua, null);
-  assert.equal(api._state.predHistory['sunhot/tx'].length, 0);
+  assert.equal(result.Is_ready, false);
+  assert.equal(result.Sample_size, 4);
+  assert.equal(result.Con_thieu, 1);
+  assert.equal(result.Du_doan_side, null);
+  assert.equal(api._state.predHistory['max789/kubet'].length, 0);
 });
 
 test('A game starts forecasting only after the fifth distinct valid session is saved', async () => {
   // Only the fifth current result is returned; the previous four must have been retained locally.
   axiosState.data = {
-    phien_truoc: '105', phien_hien_tai: '106', ket_qua: 'Tài'
+    Phien: 105, Phien_tiep: 106, Xuc_xac: '4 - 4 - 5', Tong: 13, Ket_qua: 'Tài'
   };
-  const result = await api.runPredict('sunhot/tx');
-  assert.equal(result.trang_thai, 'đã sẵn sàng');
-  assert.equal(result.san_sang, true);
-  assert.equal(result.so_phien_du_lieu, 5);
-  assert.ok(['Tài', 'Xỉu'].includes(result.du_doan));
-  assert.equal(result.phien_tiep, 106);
-  assert.equal(api._state.predHistory['sunhot/tx'].length, 1);
+  const result = await api.runPredict('max789/kubet');
+  assert.equal(result.Trang_thai, 'DA_SAN_SANG');
+  assert.equal(result.Is_ready, true);
+  assert.equal(result.Sample_size, 5);
+  assert.ok(['Tài', 'Xỉu'].includes(result.Du_doan));
+  assert.equal(result.Phien_tiep, 106);
+  assert.equal(api._state.predHistory['max789/kubet'].length, 1);
 });
 
 test('Three consecutive settled misses trigger one protected skipped session, then learning resumes', async () => {
@@ -340,9 +444,9 @@ test('Three consecutive settled misses trigger one protected skipped session, th
     { Phien: 300, Xuc_xac_1: 1, Xuc_xac_2: 3, Xuc_xac_3: 4, Tong: 8, Ket_qua: 'Xỉu' }
   ];
   const paused = await api.runPredict('betvip/tx');
-  assert.equal(paused.trang_thai, 'tạm dừng bảo vệ');
-  assert.equal(paused.du_doan, null);
-  assert.equal(paused.so_lan_sai_lien_tiep, 3);
+  assert.equal(paused.Trang_thai, 'TAM_DUNG_BAO_VE');
+  assert.equal(paused.Du_doan, null);
+  assert.equal(paused.Consecutive_losses, 3);
   assert.equal(api._state.predHistory['betvip/tx'][0].risk_pause, true);
 
   axiosState.data = [
@@ -354,110 +458,17 @@ test('Three consecutive settled misses trigger one protected skipped session, th
     { Phien: 300, Xuc_xac_1: 1, Xuc_xac_2: 3, Xuc_xac_3: 4, Tong: 8, Ket_qua: 'Xỉu' }
   ];
   const resumed = await api.runPredict('betvip/tx');
-  assert.equal(resumed.trang_thai, 'đã sẵn sàng');
-  assert.ok(['Tài', 'Xỉu'].includes(resumed.du_doan));
-  assert.equal(resumed.phien_tiep, 306);
+  assert.equal(resumed.Trang_thai, 'DA_SAN_SANG');
+  assert.ok(['Tài', 'Xỉu'].includes(resumed.Du_doan));
+  assert.equal(resumed.Phien_tiep, 306);
 });
 
 test('Risk-pause history is labeled separately and is not counted as a loss', () => {
   const row = { phien: '888', du_doan: 'Tạm dừng bảo vệ', risk_pause: true, pause_reason: 'test', ok: null };
-  assert.match(api.formatHistoryRow(row, api.GAMES['lc79/tx']), /888 · tạm nghỉ · ⏸️/);
+  assert.match(api.formatHistoryRow(row, api.GAMES['lc79/tx']), /TẠM DỪNG BẢO VỆ/);
   api._state.predHistory['max789/kubet'] = [row,
     { phien: '887', du_doan: 'Tài', pred_side: 'T', ok: false },
     { phien: '886', du_doan: 'Tài', pred_side: 'T', ok: false }
   ];
   assert.equal(api.consecutiveLossState('max789/kubet').count, 0);
-});
-
-
-test('Xocdia accepts a result-only Vietnamese pattern without reading dice', () => {
-  const row = api.parseLc79Xocdia({ data: [{
-    Phien: 777,
-    Ket_qua: '3 đỏ - 1 trắng',
-    Phien_tiep: 778
-  }] })[0];
-  assert.equal(row.session, '777');
-  assert.equal(row.side, 'LE');
-  assert.equal(row.vi, '3 đỏ - 1 trắng');
-  assert.equal(row.doCount, 3);
-  assert.equal(row.trangCount, 1);
-  assert.deepEqual(row.dice, []);
-});
-
-test('Xocdia prefers the derived red/white parity when API parity conflicts', () => {
-  const row = api.parseLc79Xocdia({ list: [{
-    Phien: 779,
-    resultVi: '3 đỏ - 1 trắng',
-    Ket_qua: 'Chẵn'
-  }] })[0];
-  assert.equal(row.side, 'LE');
-  assert.match(row.dataWarning, /lệch mẫu màu 3 đỏ - 1 trắng/);
-});
-
-test('Xocdia can parse four color values and never labels them as dice', () => {
-  const row = api.parseLc79Xocdia({ list: [{
-    Phien: 778,
-    Ket_qua: ['đỏ', 'trắng', 'đỏ', 'đỏ']
-  }] })[0];
-  assert.equal(row.vi, '3 đỏ - 1 trắng');
-  assert.equal(row.side, 'LE');
-  assert.deepEqual(row.dice, []);
-});
-
-test('Game root exposes per-game correct/wrong/rate statistics in Vietnamese', () => {
-  api._state.predHistory['lc79/tx'] = [
-    { phien: '3', ok: true },
-    { phien: '2', ok: false },
-    { phien: '1', ok: null }
-  ];
-  const handler = registeredRoutes.get('GET /');
-  let body;
-  handler({}, { json(value) { body = value; } });
-  assert.equal(body.phien_ban, '5.0.0');
-  assert.ok(!Object.hasOwn(body, 'games'));
-  const lc79 = body.cac_game.find(game => game.ma_game === 'lc79/tx');
-  assert.deepEqual(lc79.thong_ke, {
-    tong_phien: 3, dung: 1, sai: 1, dang_cho: 1,
-    bo_qua: 0, tam_dung: 0, da_chot: 2, ti_le_dung: 50
-  });
-  assert.ok(!body.cac_game.some(game => game.ma_game === 'sunwin/sicbo'));
-});
-
-test('History response has compact result-only rows and Xocdia never includes dice fields', async () => {
-  api._state.predHistory['lc79/xocdia'] = [
-    { phien: '900', du_doan: 'Lẻ', pred_side: 'LE', actual: 'Lẻ', actual_side: 'LE', actual_vi: '3 đỏ - 1 trắng', ok: true, actual_dice: null }
-  ];
-  axiosState.data = { Phien: 901, Ket_qua: '2 đỏ - 2 trắng', Phien_tiep: 902 };
-  const handler = registeredRoutes.get('GET /:brand/:table/history');
-  let body = null;
-  const res = { statusCode: 200, status(code) { this.statusCode = code; return this; }, json(value) { body = value; return this; } };
-  await handler({ params: { brand: 'lc79', table: 'xocdia' } }, res);
-  assert.equal(res.statusCode, 200);
-  assert.ok(body.lich_su.some(line => line === '900 · 3 đỏ - 1 trắng · Lẻ · ✅'));
-  assert.ok(body.cac_phien.every(row => !Object.hasOwn(row, 'xuc_xac')));
-  assert.ok(body.lich_su.every(line => !/Dự đoán|xúc xắc/i.test(line)));
-  axiosState.data = null;
-});
-
-
-test('Xocdia prediction JSON is Vietnamese and contains no dice or sum keys', async () => {
-  api._state.predHistory['lc79/xocdia'] = [];
-  axiosState.data = { list: [
-    { Phien: 1005, Ket_qua: '3 đỏ - 1 trắng' },
-    { Phien: 1004, Ket_qua: '2 đỏ - 2 trắng' },
-    { Phien: 1003, Ket_qua: '1 đỏ - 3 trắng' },
-    { Phien: 1002, Ket_qua: '4 đỏ - 0 trắng' },
-    { Phien: 1001, Ket_qua: '3 đỏ - 1 trắng' }
-  ] };
-  const result = await api.runPredict('lc79/xocdia');
-  assert.equal(result.ten_game, 'LC79 Xóc Đĩa');
-  assert.equal(result.ket_qua, 'Lẻ');
-  assert.equal(result.san_sang, true);
-  assert.ok(result.chuoi_cau.includes('Chẵn') || result.chuoi_cau.includes('Lẻ'));
-  assert.match(result.mau_ket_qua, /đỏ - .*trắng/);
-  assert.ok(result.vi_du_doan === '2 đỏ - 2 trắng' || /đỏ - .*trắng/.test(result.vi_du_doan));
-  assert.ok(!Object.hasOwn(result, 'xuc_xac'));
-  assert.ok(!Object.hasOwn(result, 'tong'));
-  assert.ok(!Object.keys(result).some(key => /^(id|Name|Phien|Ket_qua|Du_doan|Time|Sample_size)$/.test(key)));
-  axiosState.data = null;
 });
