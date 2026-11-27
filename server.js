@@ -1,5 +1,5 @@
 /**
- * PRED-API v4.1.2 — Tài Xỉu / Xóc Đĩa đa game
+ * PRED-API v4.2.0 — Algorithm-only core / Tài Xỉu / Xóc Đĩa đa game
  * Node >= 18 | Render: npm install && npm start
  *
  * Lưu ý: dữ liệu kết quả là ngẫu nhiên/được tạo bởi hệ thống game. Bộ phân tích
@@ -12,14 +12,16 @@ const axios = require('axios');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const AlgorithmOnly = require('./algorithm-only');
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 const POLL_MS = Math.max(10000, Number(process.env.POLL_MS) || 25000);
 const SOURCE_LIMIT = Math.max(200, Number(process.env.SOURCE_LIMIT) || 1200);
 const PRED_LIMIT = Math.max(20, Number(process.env.PRED_HISTORY_LIMIT) || 50);
-// Never emit a forecast from fewer than five distinct, usable source sessions.
-const MIN_HISTORY_SESSIONS = Math.max(5, Number(process.env.MIN_HISTORY_SESSIONS) || 5);
+// The extracted algorithm requires at least 15 distinct, usable source sessions.
+const requestedMinHistory = Number(process.env.MIN_HISTORY_SESSIONS);
+const MIN_HISTORY_SESSIONS = Math.max(AlgorithmOnly.MIN_HISTORY, Number.isFinite(requestedMinHistory) && requestedMinHistory > 0 ? requestedMinHistory : AlgorithmOnly.MIN_HISTORY);
 const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
@@ -122,6 +124,26 @@ function saveJSON(file, data) {
   }
 }
 
+function saveAlgorithmLearning() {
+  const snapshot = {};
+  for (const gameId of Object.keys(GAMES)) {
+    snapshot[gameId] = AlgorithmOnly.getAlgorithmLearningState(gameId);
+  }
+  saveJSON('algorithm_learning.json', snapshot);
+}
+
+function loadAlgorithmLearning() {
+  const saved = loadJSON('algorithm_learning.json', {});
+  if (!saved || typeof saved !== 'object' || Array.isArray(saved)) return;
+  for (const [gameId, state] of Object.entries(saved)) {
+    try { AlgorithmOnly.setAlgorithmLearningState(gameId, state); }
+    catch (error) { console.error('[ALGO-LEARNING-LOAD]', gameId, error.message); }
+  }
+}
+
+// Restore per-game pattern weights before the first prediction is generated.
+loadAlgorithmLearning();
+
 function safeFilePart(value) {
   return String(value).replace(/[^a-z0-9_-]/gi, '_');
 }
@@ -132,27 +154,6 @@ function nowVN() {
   });
 }
 
-function makeModelProfile(name, options = {}) {
-  return {
-    name,
-    shortWindow: options.shortWindow || 12,
-    mediumWindow: options.mediumWindow || 35,
-    longWindow: options.longWindow || 80,
-    ewmaAlpha: options.ewmaAlpha || 0.10,
-    markovPriors: options.markovPriors || [8, 12, 16],
-    patternMaxOrder: options.patternMaxOrder || 6,
-    patternMinMatches: options.patternMinMatches || 2,
-    patternPrior: options.patternPrior || 7,
-    runPrior: options.runPrior || 8,
-    cyclePrior: options.cyclePrior || 8,
-    cycleMaxPeriod: options.cycleMaxPeriod || 6,
-    sumBandPrior: options.sumBandPrior || 10,
-    diceMaxReliability: options.diceMaxReliability || 0.45,
-    evalWindow: options.evalWindow || 55,
-    backtestMin: options.backtestMin || 12,
-    weights: options.weights || {}
-  };
-}
 
 /* ================================ HELPERS ================================ */
 function normText(value) {
@@ -568,671 +569,27 @@ function mergeSourceHistory(gameId, incomingRows) {
   return mergedRows.reverse(); // newest-first
 }
 
-/* =========================== PREDICTION ENGINE =========================== */
-function binarySide(side, type) {
-  if (type === 'xocdia') {
-    if (side === 'CHAN') return 'T';
-    if (side === 'LE') return 'X';
-    return null;
-  }
-  return side === 'T' || side === 'X' ? side : null;
-}
-
-function smoothedRate(values, base, prior = 8) {
-  if (!values.length) return base;
-  const countT = values.filter(v => v === 'T').length;
-  return (countT + base * prior) / (values.length + prior);
-}
-
-function currentRun(sides) {
-  if (!sides.length) return 0;
-  const last = sides[sides.length - 1];
-  let run = 1;
-  for (let i = sides.length - 2; i >= 0 && sides[i] === last; i--) run++;
-  return run;
-}
-
-function markovRate(sides, order, base, prior) {
-  if (sides.length <= order) return base;
-  const context = sides.slice(-order);
-  let count = 0;
-  let countT = 0;
-  for (let i = 0; i + order < sides.length; i++) {
-    let match = true;
-    for (let j = 0; j < order; j++) {
-      if (sides[i + j] !== context[j]) { match = false; break; }
-    }
-    if (match) {
-      count++;
-      if (sides[i + order] === 'T') countT++;
-    }
-  }
-  return (countT + base * prior) / (count + prior);
-}
-
-function patternRate(sides, base, profile) {
-  for (let order = Math.min(profile.patternMaxOrder, sides.length - 1); order >= 2; order--) {
-    const context = sides.slice(-order);
-    let count = 0;
-    let countT = 0;
-    for (let i = 0; i + order < sides.length; i++) {
-      let match = true;
-      for (let j = 0; j < order; j++) {
-        if (sides[i + j] !== context[j]) { match = false; break; }
-      }
-      if (match) {
-        count++;
-        if (sides[i + order] === 'T') countT++;
-      }
-    }
-    if (count >= profile.patternMinMatches) {
-      return (countT + base * profile.patternPrior) / (count + profile.patternPrior);
-    }
-  }
-  return base;
-}
-
-function runRate(sides, base, profile) {
-  if (!sides.length) return base;
-  const lastSide = sides[sides.length - 1];
-  const wanted = Math.min(7, currentRun(sides));
-  const runLengths = Array(sides.length).fill(1);
-  for (let i = 1; i < sides.length; i++) {
-    runLengths[i] = sides[i] === sides[i - 1] ? runLengths[i - 1] + 1 : 1;
-  }
-  let count = 0;
-  let countT = 0;
-  for (let i = 0; i < sides.length - 1; i++) {
-    // Chỉ so các chuỗi bệt cùng cửa với trạng thái hiện tại.
-    if (sides[i] === lastSide && Math.min(7, runLengths[i]) === wanted) {
-      count++;
-      if (sides[i + 1] === 'T') countT++;
-    }
-  }
-  return (countT + base * profile.runPrior) / (count + profile.runPrior);
-}
-
-function sumBand(sum) {
-  if (!Number.isFinite(Number(sum))) return null;
-  const n = Number(sum);
-  if (n <= 7) return 'low';
-  if (n <= 13) return 'mid';
-  return 'high';
-}
-
-function sumBandRate(rows, binaryRows, base, profile) {
-  const latest = rows[rows.length - 1];
-  const bucket = latest ? sumBand(latest.sum) : null;
-  if (!bucket) return base;
-  let count = 0;
-  let countT = 0;
-  for (let i = 0; i < rows.length - 1; i++) {
-    if (sumBand(rows[i].sum) !== bucket || !binaryRows[i + 1]) continue;
-    count++;
-    if (binaryRows[i + 1] === 'T') countT++;
-  }
-  return (countT + base * profile.sumBandPrior) / (count + profile.sumBandPrior);
-}
-
-function diceDistributionRate(rows) {
-  const recent = rows.slice(-120).filter(row => Array.isArray(row.dice) && row.dice.length === 3);
-  if (recent.length < 12) return null;
-  const counts = [0, 0, 0, 0, 0, 0];
-  let total = 0;
-  for (const row of recent) {
-    for (const face of row.dice) {
-      const n = Number(face);
-      if (n >= 1 && n <= 6) { counts[n - 1]++; total++; }
-    }
-  }
-  if (!total) return null;
-  // Prior 3 lần mỗi mặt giúp tránh phản ứng quá mạnh với mẫu nhỏ.
-  const probs = counts.map(c => (c + 3) / (total + 18));
-  let dist = [1];
-  for (let die = 0; die < 3; die++) {
-    const next = Array(19).fill(0);
-    for (let sum = 0; sum < dist.length; sum++) {
-      for (let face = 1; face <= 6; face++) next[sum + face] += dist[sum] * probs[face - 1];
-    }
-    dist = next;
-  }
-  let low = 0;
-  let high = 0;
-  for (let sum = 3; sum <= 18; sum++) {
-    if (sum >= 11) high += dist[sum] || 0;
-    else low += dist[sum] || 0;
-  }
-  return high + low > 0 ? high / (high + low) : null;
-}
-
-/**
- * Phân tích cấu trúc cầu nâng cao (bệt, đảo, cụm, chu kỳ, gãy, hỗn hợp).
- * Dùng cho lý do, điều chỉnh confidence nhẹ và regime-aware weighting (ưu tiên LC79).
- * Không thay đổi công thức cốt lõi của các component Markov/pattern/run hiện có.
- */
-function entropyOfSides(sides, window = 20) {
-  const seq = sides.slice(-window);
-  if (seq.length < 4) return 1;
-  const counts = { T: 0, X: 0 };
-  for (const s of seq) counts[s] = (counts[s] || 0) + 1;
-  const n = seq.length;
-  let h = 0;
-  for (const c of Object.values(counts)) {
-    if (c > 0) {
-      const p = c / n;
-      h -= p * Math.log2(p);
-    }
-  }
-  return h; // 0 = pure, 1 = balanced
-}
-
-function switchRate(sides, window = 20) {
-  const seq = sides.slice(-window);
-  if (seq.length < 2) return 0.5;
-  let switches = 0;
-  for (let i = 1; i < seq.length; i++) if (seq[i] !== seq[i - 1]) switches++;
-  return switches / (seq.length - 1);
-}
-
-function detectCycle(sides, maxPeriod = 6) {
-  const seq = sides.slice(-Math.min(40, sides.length));
-  if (seq.length < 8) return null;
-  let best = null;
-  for (let period = 2; period <= maxPeriod; period++) {
-    // Cần ít nhất ba chu kỳ quan sát được; tránh gán chu kỳ từ mẫu quá ngắn.
-    if (seq.length < period * 3) continue;
-    let matches = 0;
-    let total = 0;
-    for (let i = period; i < seq.length; i++) {
-      if (seq[i] === seq[i - period]) matches++;
-      total++;
-    }
-    const score = total > 0 ? matches / total : 0;
-    if (score >= 0.72 && total >= period * 2) {
-      if (!best || score > best.score || (score === best.score && period < best.period)) {
-        best = { period, score, matches, total };
-      }
-    }
-  }
-  return best;
-}
-
-// Dự báo yếu theo chu kỳ: chỉ là một thành phần xác suất nhỏ trong ensemble,
-// không được coi việc nhận diện chu kỳ là bằng chứng chắc chắn cho phiên kế tiếp.
-function cycleForecastRate(sides, profile = {}) {
-  const cycle = detectCycle(sides, profile.cycleMaxPeriod || 6);
-  if (!cycle || cycle.period < 3 || cycle.total < cycle.period * 2) return null;
-  const expected = sides[sides.length - cycle.period];
-  if (expected !== 'T' && expected !== 'X') return null;
-  const prior = Math.max(4, Number(profile.cyclePrior) || 8);
-  const repeatRate = (cycle.matches + prior * 0.5) / (cycle.total + prior);
-  // Co xác suất về 50% khi số lần lặp chưa nhiều.
-  const support = Math.min(1, cycle.total / Math.max(20, cycle.period * 5));
-  const expectedProbability = 0.5 + (repeatRate - 0.5) * support;
-  return expected === 'T' ? expectedProbability : 1 - expectedProbability;
-}
-
-function runLengthSegments(seq) {
-  const runs = [];
-  for (const side of seq) {
-    const last = runs[runs.length - 1];
-    if (last && last.side === side) last.length++;
-    else runs.push({ side, length: 1 });
-  }
-  return runs;
-}
-
-function detectDaoPattern(sides) {
-  const seq = sides.slice(-16);
-  if (seq.length < 6) return null;
-  const runs = runLengthSegments(seq);
-
-  // 1-1 không phụ thuộc điểm bắt đầu của cửa sổ.
-  if (runs.length >= 6 && runs.every(run => run.length === 1)) {
-    return { type: 'DAO_11', length: seq.length, stability: 1, runCount: runs.length };
-  }
-
-  // 2-2 / 3-3: dùng độ dài các nhịp liên tiếp, không chia cặp từ index 0.
-  // Hai đầu cửa sổ có thể là nhịp bị cắt; các nhịp ở giữa phải khớp chính xác.
-  for (const target of [2, 3]) {
-    if (runs.length < 4 || seq.length < target * 3) continue;
-    const edgesValid = runs[0].length >= 1 && runs[0].length <= target &&
-      runs[runs.length - 1].length >= 1 && runs[runs.length - 1].length <= target;
-    const middleValid = runs.slice(1, -1).every(run => run.length === target);
-    if (edgesValid && middleValid) {
-      return {
-        type: target === 2 ? 'DAO_22' : 'DAO_33',
-        length: seq.length,
-        stability: target === 2 ? 0.9 : 0.85,
-        runCount: runs.length
-      };
-    }
-  }
-  return null;
-}
-
-function detectCumPattern(sides) {
-  // Chỉ nhận dạng khi mẫu nằm ở CUỐI chuỗi. Không lấy một mẫu cũ đã bị gãy
-  // ở giữa cửa sổ làm bằng chứng rằng cầu hiện tại vẫn tiếp tục.
-  const str = sides.slice(-12).join('');
-  if (str.length < 5) return null;
-  const repeated = [
-    { unit: 'TTX', name: '2-1' }, { unit: 'XXT', name: '2-1' },
-    { unit: 'TXX', name: '1-2' }, { unit: 'XTT', name: '1-2' },
-    { unit: 'TTTX', name: '3-1' }, { unit: 'XXXT', name: '3-1' },
-    { unit: 'TXXX', name: '1-3' }, { unit: 'XTTT', name: '1-3' }
-  ];
-  for (const item of repeated) {
-    for (let count = 4; count >= 2; count--) {
-      const pattern = item.unit.repeat(count);
-      if (str.endsWith(pattern)) return { type: 'CUM', name: item.name, match: pattern };
-    }
-  }
-  const suffixPatterns = [
-    { pattern: 'TTXTTX', name: '2-1-2' },
-    { pattern: 'XXTXXT', name: '2-1-2' },
-    { pattern: 'TXTTXT', name: '1-2-1' },
-    { pattern: 'XTXXTX', name: '1-2-1' }
-  ];
-  for (const item of suffixPatterns) {
-    if (str.endsWith(item.pattern)) return { type: 'CUM', name: item.name, match: item.pattern };
-  }
-  return null;
-}
-
-function analyzeCauStructure(sides) {
-  if (!sides || sides.length < 5) {
-    return {
-      regime: 'WEAK',
-      run: 0,
-      switchRate: 0.5,
-      entropy: 1,
-      cycle: null,
-      dao: null,
-      cum: null,
-      stability: 0,
-      description: 'Dữ liệu chưa đủ để nhận diện cầu'
-    };
-  }
-
-  const run = currentRun(sides);
-  const last = sides[sides.length - 1];
-  const sw = switchRate(sides, 20);
-  const ent = entropyOfSides(sides, 20);
-  const cycle = detectCycle(sides);
-  const dao = detectDaoPattern(sides);
-  const cum = detectCumPattern(sides);
-
-  let regime = 'MIXED';
-  let stability = 0.4;
-  let description = 'Cầu hỗn hợp / tín hiệu yếu';
-
-  if (run >= 5) {
-    regime = 'BET';
-    stability = Math.min(0.95, 0.55 + run * 0.06);
-    description = `Bệt ${run} phiên ${last === 'T' ? 'Tài' : 'Xỉu'}`;
-  } else if (run >= 3 && sw < 0.35) {
-    regime = 'BET';
-    stability = 0.6;
-    description = `Bệt ngắn ${run} phiên, xu hướng đang giữ`;
-  } else if (dao) {
-    regime = dao.type;
-    stability = dao.stability;
-    description = `Đảo ${dao.type.replace('DAO_', '')} ổn định (~${dao.length} phiên)`;
-  } else if (cycle && cycle.score >= 0.78) {
-    regime = 'CYCLE';
-    stability = cycle.score;
-    description = `Chu kỳ ${cycle.period} (khớp ${(cycle.score * 100).toFixed(0)}%)`;
-  } else if (cum) {
-    regime = 'CUM';
-    stability = 0.65;
-    description = `Cầu cụm dạng ${cum.name}`;
-  } else if (sw > 0.65 && ent > 0.9) {
-    regime = 'MIXED';
-    stability = 0.25;
-    description = 'Cầu hỗn hợp, tần suất đổi cửa cao';
-  } else if (sw < 0.4) {
-    regime = 'BET';
-    stability = 0.5;
-    description = 'Xu hướng bệt nhẹ / ít đảo';
-  }
-
-  // Phát hiện gãy: nếu trước đó có bệt dài hoặc đảo rõ nhưng gần đây bị phá
-  const recent = sides.slice(-8);
-  const older = sides.slice(-16, -8);
-  if (older.length >= 6) {
-    const oldRun = currentRun(older);
-    const oldSw = switchRate(older, 8);
-    if ((oldRun >= 4 || oldSw < 0.25) && sw > 0.55 && run <= 2) {
-      regime = 'GAY';
-      stability = 0.35;
-      description = 'Cầu gãy: cấu trúc cũ bị phá, đang chuyển trạng thái';
-    }
-  }
-
-  return {
-    regime,
-    run,
-    last,
-    switchRate: Math.round(sw * 1000) / 1000,
-    entropy: Math.round(ent * 1000) / 1000,
-    cycle,
-    dao,
-    cum,
-    stability: Math.round(stability * 1000) / 1000,
-    description
-  };
-}
-
-
-const DEFAULT_MODEL_WEIGHTS = {
-  base: 0.15, short: 0.11, medium: 0.10, long: 0.08, ewma: 0.10,
-  markov1: 0.11, markov2: 0.10, markov3: 0.07,
-  pattern: 0.08, run: 0.06, cycle: 0.03, sumBand: 0.02, dice: 0.02
-};
-
-// Every endpoint has its own profile and learns only from that game's source file.
-// The profiles start with different time horizons; walk-forward scores then adjust
-// component weights independently for each game.
-const MODEL_PROFILES = {
-  'lc79/tx': makeModelProfile('lc79-tx-adaptive', {
-    shortWindow: 10, mediumWindow: 30, longWindow: 72, ewmaAlpha: 0.13,
-    markovPriors: [7, 11, 15], patternMaxOrder: 6, patternMinMatches: 2,
-    patternPrior: 6, runPrior: 7, sumBandPrior: 10, evalWindow: 64,
-    weights: { short: 0.15, medium: 0.09, long: 0.05, ewma: 0.11, markov1: 0.11, markov2: 0.11, markov3: 0.08, pattern: 0.12, run: 0.08, cycle: 0.05, sumBand: 0.03, dice: 0.06 }
-  }),
-  'lc79/md5': makeModelProfile('lc79-md5-adaptive', {
-    shortWindow: 12, mediumWindow: 34, longWindow: 78, ewmaAlpha: 0.11,
-    markovPriors: [8, 12, 16], patternMaxOrder: 6, patternMinMatches: 2,
-    patternPrior: 7, runPrior: 7, sumBandPrior: 10, evalWindow: 64,
-    weights: { short: 0.13, medium: 0.10, long: 0.06, ewma: 0.10, markov1: 0.11, markov2: 0.11, markov3: 0.09, pattern: 0.11, run: 0.08, cycle: 0.04, sumBand: 0.03, dice: 0.07 }
-  }),
-  'lc79/xocdia': makeModelProfile('lc79-xocdia-parity', {
-    shortWindow: 16, mediumWindow: 42, longWindow: 96, ewmaAlpha: 0.09,
-    markovPriors: [9, 13, 17], patternMaxOrder: 5, patternMinMatches: 3,
-    patternPrior: 8, runPrior: 9, sumBandPrior: 12, evalWindow: 60,
-    weights: { short: 0.10, medium: 0.11, long: 0.09, ewma: 0.10, markov1: 0.12, markov2: 0.11, markov3: 0.06, pattern: 0.08, run: 0.08, cycle: 0.04 }
-  }),
-  'betvip/tx': makeModelProfile('betvip-tx-conservative', {
-    // BETVIP live ~38%: giảm phản ứng ngắn hạn, tăng medium/long + Markov, siết pattern
-    shortWindow: 16, mediumWindow: 48, longWindow: 100, ewmaAlpha: 0.08,
-    markovPriors: [10, 14, 18], patternMaxOrder: 4, patternMinMatches: 3,
-    patternPrior: 10, runPrior: 10, sumBandPrior: 12, evalWindow: 64,
-    weights: { short: 0.08, medium: 0.14, long: 0.12, ewma: 0.09, markov1: 0.13, markov2: 0.12, markov3: 0.08, pattern: 0.06, run: 0.06, cycle: 0.03, sumBand: 0.03, dice: 0.05 }
-  }),
-  'betvip/md5': makeModelProfile('betvip-md5-conservative', {
-    shortWindow: 14, mediumWindow: 44, longWindow: 96, ewmaAlpha: 0.09,
-    markovPriors: [9, 13, 17], patternMaxOrder: 5, patternMinMatches: 3,
-    patternPrior: 9, runPrior: 9, sumBandPrior: 11, evalWindow: 62,
-    weights: { short: 0.09, medium: 0.13, long: 0.11, ewma: 0.09, markov1: 0.12, markov2: 0.12, markov3: 0.08, pattern: 0.07, run: 0.06, cycle: 0.03, sumBand: 0.03, dice: 0.05 }
-  }),
-  'max789/tx': makeModelProfile('max789-tx-longer-context', {
-    shortWindow: 18, mediumWindow: 48, longWindow: 112, ewmaAlpha: 0.075,
-    markovPriors: [10, 15, 20], patternMaxOrder: 5, patternMinMatches: 3,
-    patternPrior: 9, runPrior: 10, sumBandPrior: 12, evalWindow: 64,
-    weights: { short: 0.08, medium: 0.12, long: 0.11, ewma: 0.08, markov1: 0.13, markov2: 0.11, markov3: 0.06, pattern: 0.08, run: 0.07, sumBand: 0.03, dice: 0.08 }
-  }),
-  'max789/md5': makeModelProfile('max789-md5-longer-context', {
-    shortWindow: 16, mediumWindow: 46, longWindow: 108, ewmaAlpha: 0.08,
-    markovPriors: [9, 14, 19], patternMaxOrder: 5, patternMinMatches: 3,
-    patternPrior: 9, runPrior: 10, sumBandPrior: 12, evalWindow: 64,
-    weights: { short: 0.09, medium: 0.12, long: 0.10, ewma: 0.09, markov1: 0.12, markov2: 0.11, markov3: 0.07, pattern: 0.09, run: 0.07, sumBand: 0.03, dice: 0.08 }
-  }),
-  'max789/kubet': makeModelProfile('max789-kubet-context', {
-    shortWindow: 14, mediumWindow: 42, longWindow: 96, ewmaAlpha: 0.09,
-    markovPriors: [8, 13, 18], patternMaxOrder: 5, patternMinMatches: 3,
-    patternPrior: 8, runPrior: 9, sumBandPrior: 11, evalWindow: 60,
-    weights: { short: 0.10, medium: 0.12, long: 0.09, ewma: 0.10, markov1: 0.12, markov2: 0.11, markov3: 0.07, pattern: 0.09, run: 0.07, sumBand: 0.03, dice: 0.08 }
-  }),
-  'hitclub/tx': makeModelProfile('hitclub-tx-recent-context', {
-    shortWindow: 12, mediumWindow: 36, longWindow: 88, ewmaAlpha: 0.11,
-    markovPriors: [8, 12, 17], patternMaxOrder: 6, patternMinMatches: 2,
-    patternPrior: 7, runPrior: 8, sumBandPrior: 10, evalWindow: 58,
-    weights: { short: 0.13, medium: 0.11, long: 0.07, ewma: 0.11, markov1: 0.12, markov2: 0.10, markov3: 0.07, pattern: 0.10, run: 0.07, cycle: 0.03, sumBand: 0.03, dice: 0.06 }
-  }),
-  'hitclub/md5': makeModelProfile('hitclub-md5-pattern-context', {
-    shortWindow: 10, mediumWindow: 34, longWindow: 80, ewmaAlpha: 0.12,
-    markovPriors: [7, 12, 16], patternMaxOrder: 6, patternMinMatches: 2,
-    patternPrior: 7, runPrior: 8, sumBandPrior: 10, evalWindow: 58,
-    weights: { short: 0.14, medium: 0.10, long: 0.06, ewma: 0.12, markov1: 0.11, markov2: 0.10, markov3: 0.08, pattern: 0.11, run: 0.07, cycle: 0.03, sumBand: 0.03, dice: 0.06 }
-  })
-};
-
+/* =========================== ALGORITHM-ONLY ENGINE ======================= */
+// The calculation core is exclusively algorithm-only.js, extracted from the
+// supplied văn bản.txt. Each game receives an isolated learning profile key.
 function getModelProfile(gameId) {
-  return MODEL_PROFILES[gameId] || makeModelProfile('default-balanced', { weights: DEFAULT_MODEL_WEIGHTS });
-}
-
-function getComponents(history, type, profile, gameId = 'default') {
-  const usableRows = history.filter(row => binarySide(row.side, type));
-  const sides = usableRows.map(row => binarySide(row.side, type));
-  const n = sides.length;
-  if (n < 5) return null;
-
-  const tCount = sides.filter(side => side === 'T').length;
-  const base = (tCount + 5) / (n + 10);
-  const components = {
-    base,
-    short: smoothedRate(sides.slice(-profile.shortWindow), base, 6),
-    medium: smoothedRate(sides.slice(-profile.mediumWindow), base, 10),
-    long: smoothedRate(sides.slice(-profile.longWindow), base, 16),
-    markov1: markovRate(sides, 1, base, profile.markovPriors[0]),
-    markov2: markovRate(sides, 2, base, profile.markovPriors[1]),
-    markov3: markovRate(sides, 3, base, profile.markovPriors[2]),
-    pattern: patternRate(sides, base, profile),
-    run: runRate(sides, base, profile),
-    sumBand: sumBandRate(usableRows, sides, base, profile)
-  };
-
-  let ewma = base;
-  for (const side of sides.slice(-profile.longWindow)) {
-    ewma = (1 - profile.ewmaAlpha) * ewma + profile.ewmaAlpha * (side === 'T' ? 1 : 0);
-  }
-  const ewmaReliability = Math.min(1, n / 35);
-  components.ewma = base * (1 - ewmaReliability) + ewma * ewmaReliability;
-
-  if (type !== 'xocdia') {
-    const diceRate = diceDistributionRate(usableRows);
-    if (diceRate !== null) {
-      // Giảm ảnh hưởng mô hình xúc xắc khi chưa đủ nhiều phiên.
-      const diceReliability = Math.min(profile.diceMaxReliability, Math.max(0, (n - 10) / 180));
-      components.dice = base * (1 - diceReliability) + diceRate * diceReliability;
-    }
-  }
-
-  // Component chu kỳ được bật cho LC79/BETVIP/HITCLUB. MAX789 được giữ nguyên
-  // ensemble và trọng số; chỉ nhận metadata cầu như trước.
-  if (!String(gameId).startsWith('max789/')) {
-    const cycleRate = cycleForecastRate(sides, profile);
-    if (cycleRate !== null) components.cycle = cycleRate;
-  }
-  return { components, sides, n, run: currentRun(sides), last: sides[n - 1], usableRows };
-}
-
-function modelProbability(history, type, gameId = 'default') {
-  const profile = getModelProfile(gameId);
-  const current = getComponents(history, type, profile, gameId);
-  if (!current) return null;
-  const { components, sides, n, run, last, usableRows } = current;
-  const adaptive = {};
-
-  // Tự chấm từng mô hình trên các phiên đã xảy ra (walk-forward), không dùng
-  // kết quả tương lai của phiên đang dự đoán. Độ tin cậy được co về 50% để
-  // tránh một đoạn cầu ngắn làm thay đổi trọng số quá mạnh.
-  const start = Math.max(profile.backtestMin, n - profile.evalWindow);
-  const wins = {};
-  const trials = {};
-  for (let i = start; i < n; i++) {
-    const pastRows = usableRows.slice(0, i);
-    const sample = getComponents(pastRows, type, profile, gameId);
-    if (!sample) continue;
-    const actual = sides[i];
-    for (const [key, probability] of Object.entries(sample.components)) {
-      if (!Number.isFinite(probability)) continue;
-      trials[key] = (trials[key] || 0) + 1;
-      if ((probability >= 0.5 ? 'T' : 'X') === actual) wins[key] = (wins[key] || 0) + 1;
-    }
-  }
-
-  let weighted = 0;
-  let totalWeight = 0;
-  const componentRows = [];
-  for (const [key, probability] of Object.entries(components)) {
-    if (!Number.isFinite(probability)) continue;
-    const count = trials[key] || 0;
-    const hit = wins[key] || 0;
-    const accuracy = (hit + 5) / (count + 10); // prior tương đương 10 lần thử, 5 lần đúng
-    const factor = count >= 8 ? Math.max(0.72, Math.min(1.28, accuracy / 0.5)) : 1;
-    const weight = (profile.weights[key] || DEFAULT_MODEL_WEIGHTS[key] || 0.04) * factor;
-    weighted += probability * weight;
-    totalWeight += weight;
-    componentRows.push({ key, p: probability, weight, accuracy: count ? accuracy : null, trials: count });
-    adaptive[key] = count ? Math.round(accuracy * 100) : null;
-  }
-
-  let pT = totalWeight ? weighted / totalWeight : components.base;
-  // Biên an toàn: không hiển thị độ tin cậy ảo kiểu 90–100% trên chuỗi ngẫu nhiên.
-  pT = Math.max(0.37, Math.min(0.63, pT));
-  let side = pT >= 0.5 ? 'T' : 'X';
-  let confidence = Math.max(50, Math.min(63, Math.round(Math.max(pT, 1 - pT) * 100)));
-
-  // Phân tích cấu trúc cầu nâng cao (dùng cho lý do + điều chỉnh confidence).
-  // MAX789: chỉ dùng cho lý do, không đụng confidence cốt lõi.
-  const cauInfo = analyzeCauStructure(sides);
-  const isLc79 = gameId.startsWith('lc79/');
-  const isMax789 = gameId.startsWith('max789/');
-  const isBetvip = gameId.startsWith('betvip/');
-  const isHitclub = gameId.startsWith('hitclub/');
-
-  // Đếm đồng thuận theo NHÓM độc lập. Short/medium/long/EWMA cùng thuộc
-  // nhóm frequency; Markov 1/2/3 cùng nhóm Markov, tránh đếm trùng một loại tín hiệu.
-  const componentGroups = {
-    short: 'frequency', medium: 'frequency', long: 'frequency', ewma: 'frequency',
-    markov1: 'markov', markov2: 'markov', markov3: 'markov',
-    pattern: 'sequence', cycle: 'sequence', run: 'run', sumBand: 'sum', dice: 'dice'
-  };
-  const grouped = new Map();
-  for (const row of componentRows) {
-    if (row.key === 'base' || !Number.isFinite(row.p)) continue;
-    // Thành phần gần như chỉ lặp lại prior tổng thể không được tính là một lá phiếu.
-    if (Math.abs(row.p - components.base) < 0.015 || Math.abs(row.p - 0.5) < 0.025) continue;
-    const group = componentGroups[row.key] || row.key;
-    if (!grouped.has(group)) grouped.set(group, []);
-    grouped.get(group).push(row.p);
-  }
-  const informativeGroups = Array.from(grouped.entries()).map(([group, values]) => ({
-    group, p: values.reduce((sum, value) => sum + value, 0) / values.length
-  }));
-  const agreeCount = informativeGroups.filter(r => (r.p >= 0.5 ? 'T' : 'X') === side).length;
-  const disagreeCount = informativeGroups.filter(r => (r.p >= 0.5 ? 'T' : 'X') !== side).length;
-  const informativeKeys = new Set(informativeGroups.map(row => row.group));
-  const informativeRows = componentRows.filter(row => row.key !== 'base' &&
-    informativeKeys.has(componentGroups[row.key] || row.key) && Number.isFinite(row.p) &&
-    Math.abs(row.p - components.base) >= 0.015 && Math.abs(row.p - 0.5) >= 0.025);
-
-  if (!isMax789) {
-    if (cauInfo.regime === 'GAY') {
-      confidence = Math.max(50, confidence - 4);
-    } else if ((cauInfo.regime === 'MIXED' || cauInfo.regime === 'WEAK') && cauInfo.switchRate > 0.55) {
-      confidence = Math.max(50, confidence - 3);
-    } else if (informativeGroups.length > 0 && disagreeCount >= agreeCount && confidence <= 55) {
-      // Nhiều component mâu thuẫn → kéo conf xuống
-      confidence = Math.max(50, confidence - 2);
-    }
-
-    // LC79: chỉ tăng khi cầu rõ + đồng thuận cao
-    if (isLc79 && n >= 15 && (cauInfo.regime === 'BET' || cauInfo.regime.startsWith('DAO_') || cauInfo.regime === 'CYCLE') && cauInfo.stability >= 0.7) {
-      if (agreeCount >= 3 && disagreeCount === 0) confidence = Math.min(63, confidence + 2);
-    }
-
-    // BETVIP / HITCLUB đang yếu trên live: siết chặt hơn khi tín hiệu không rõ
-    if ((isBetvip || isHitclub) && (confidence <= 54 || cauInfo.regime === 'MIXED' || cauInfo.regime === 'GAY')) {
-      confidence = Math.max(50, Math.min(confidence, 53));
-    }
-  }
-
-  const strongest = [];
-  const strongestGroups = new Set();
-  for (const row of [...informativeRows].sort((a, b) => Math.abs(b.p - 0.5) - Math.abs(a.p - 0.5))) {
-    const group = componentGroups[row.key] || row.key;
-    if (strongestGroups.has(group)) continue;
-    strongestGroups.add(group);
-    strongest.push(row);
-    if (strongest.length >= 2) break;
-  }
-  // Nội bộ mô hình dùng T/X. Với Xóc Đĩa T tương ứng Chẵn và X tương ứng Lẻ,
-  // nên nhãn lý do phải được đổi theo loại game, không dùng chung Tài/Xỉu.
-  const sideWord = value => type === 'xocdia'
-    ? (value === 'T' ? 'Chẵn' : 'Lẻ')
-    : (value === 'T' ? 'Tài' : 'Xỉu');
-  const reasons = [];
-  // Ưu tiên mô tả cấu trúc cầu thực tế
-  if (cauInfo.regime === 'BET' && run >= 3) {
-    reasons.push(`Đang bệt ${run} phiên ${sideWord(last)}; mô hình không mặc định đảo cầu`);
-  } else if (cauInfo.regime.startsWith('DAO_')) {
-    reasons.push(cauInfo.description);
-  } else if (cauInfo.regime === 'CYCLE' && cauInfo.cycle) {
-    reasons.push(`Chu kỳ ${cauInfo.cycle.period} khớp ${(cauInfo.cycle.score * 100).toFixed(0)}%`);
-  } else if (cauInfo.regime === 'CUM') {
-    reasons.push(cauInfo.description);
-  } else if (cauInfo.regime === 'GAY') {
-    reasons.push('Cầu gãy — cấu trúc cũ bị phá, tín hiệu đang chuyển');
-  }
-  if (strongest.length && Math.abs(strongest[0].p - 0.5) >= 0.035) {
-    const label = strongest[0].key === 'markov1' || strongest[0].key === 'markov2' || strongest[0].key === 'markov3'
-      ? 'chuyển tiếp chuỗi' : strongest[0].key === 'dice' ? 'phân bố mặt xúc xắc' :
-        strongest[0].key === 'pattern' ? 'mẫu chuỗi tương tự' :
-          strongest[0].key === 'run' ? 'thống kê độ dài bệt' :
-            strongest[0].key === 'cycle' ? 'tín hiệu chu kỳ lặp' : 'cửa sổ lịch sử';
-    reasons.push(`${label} nghiêng ${sideWord(strongest[0].p >= 0.5 ? 'T' : 'X')}`);
-  }
-  if (confidence <= 53 || cauInfo.regime === 'MIXED' || cauInfo.regime === 'WEAK') {
-    reasons.push('Tín hiệu yếu hoặc cầu hỗn hợp, xác suất hai cửa gần cân bằng');
-  }
-  if (!reasons.length) reasons.push('Tổng hợp tần suất, chuỗi chuyển tiếp và kiểm định lịch sử');
-
+  const key = String(gameId || 'default').replace(/[^a-z0-9/_-]/gi, '');
   return {
-    side, confidence, pT, n, run, profile: profile.name,
-    lyDo: reasons.slice(0, 3).join(' · '),
-    cau: sides.slice(-20).map(s => s === 'T' ? 'T' : 'X').join(''),
-    adaptive,
-    components: componentRows,
-    regime: cauInfo.regime,
-    cauStructure: {
-      regime: cauInfo.regime,
-      run: cauInfo.run,
-      switchRate: cauInfo.switchRate,
-      entropy: cauInfo.entropy,
-      stability: cauInfo.stability,
-      description: cauInfo.description,
-      cycle: cauInfo.cycle ? { period: cauInfo.cycle.period, score: cauInfo.cycle.score } : null
-    }
+    name: `${key.replace(/\//g, '-')}-${AlgorithmOnly.ALGO_VERSION}`,
+    algorithm: AlgorithmOnly.ALGO_VERSION,
+    minHistory: MIN_HISTORY_SESSIONS
   };
 }
 
-function xocdiaPatternRanking(history, side) {
-  const allowed = side === 'CHAN' ? [0, 2, 4] : [1, 3];
-  // Phân phối nhị thức 4 mặt đồng xác suất, có điều kiện theo Chẵn/Lẻ.
-  const prior = side === 'CHAN'
-    ? { 0: 0.125, 2: 0.75, 4: 0.125 }
-    : { 1: 0.5, 3: 0.5 };
-  const observed = {};
-  let samples = 0;
-  for (const row of history.slice(-160)) {
-    let count = Number.isInteger(row.doCount) ? row.doCount : redCountFromVi(row.vi);
-    if (count === null || !allowed.includes(count)) continue;
-    observed[count] = (observed[count] || 0) + 1;
-    samples++;
-  }
-  const priorStrength = 12;
-  const total = samples + priorStrength;
-  return allowed.map(count => ({
-    count,
-    vi: formatXocdia(count),
-    probability: ((observed[count] || 0) + priorStrength * prior[count]) / total,
-    observed: observed[count] || 0
-  })).sort((a, b) => b.probability - a.probability);
+function algorithmLabelFromSide(side, gameType) {
+  if (gameType === 'xocdia') return side === 'CHAN' ? 'Tài' : side === 'LE' ? 'Xỉu' : null;
+  return side === 'T' ? 'Tài' : side === 'X' ? 'Xỉu' : null;
 }
 
+function translateParityText(value) {
+  if (typeof value !== 'string') return value;
+  return value.replace(/Tài/g, 'Chẵn').replace(/Xỉu/g, 'Lẻ').replace(/tài/g, 'chẵn').replace(/xỉu/g, 'lẻ');
+}
 
 class Engine {
   constructor(gameId, type) {
@@ -1290,7 +647,7 @@ class Engine {
   }
 
   validSampleCount() {
-    return this.history.filter(row => binarySide(row.side, this.type)).length;
+    return this.history.filter(row => this.type === 'xocdia' ? (row.side === 'CHAN' || row.side === 'LE') : (row.side === 'T' || row.side === 'X')).length;
   }
 
   isReady() {
@@ -1308,62 +665,99 @@ class Engine {
   }
 
   predict() {
-    if (!this.isReady()) {
+    const sampleSize = this.validSampleCount();
+    if (sampleSize < MIN_HISTORY_SESSIONS) {
       return {
         ready: false,
-        sampleSize: this.validSampleCount(),
+        sampleSize,
         requiredSamples: MIN_HISTORY_SESSIONS,
         lyDo: `Đang học dữ liệu: cần tối thiểu ${MIN_HISTORY_SESSIONS} phiên hợp lệ`
       };
     }
-    if (this.type === 'xocdia') {
-      const model = modelProbability(this.history, 'xocdia', this.id);
-      if (!model) {
-        return {
-          ready: false, sampleSize: this.validSampleCount(),
-          requiredSamples: MIN_HISTORY_SESSIONS,
-          lyDo: 'Chưa đủ dữ liệu lịch sử để chấm mô hình'
-        };
-      }
-      const side = model.side === 'T' ? 'CHAN' : 'LE';
-      const ranked = xocdiaPatternRanking(this.history, side);
+
+    const toAlgorithmResult = side => algorithmLabelFromSide(side, this.type);
+    const newestFirst = [...this.history].reverse();
+    const dataDesc = newestFirst.map(row => {
+      const result = toAlgorithmResult(row.side);
+      const dice = this.type === 'xocdia' ? [] : (Array.isArray(row.dice) ? row.dice : []);
       return {
-        side, label: sideLabel(side), conf: model.confidence,
-        pSide: model.pT, vi: ranked[0].vi,
-        topVi: ranked.map(x => x.vi),
-        viDetails: ranked.map(x => ({ vi: x.vi, probability: Math.round(x.probability * 1000) / 10 })),
-        lyDo: model.lyDo, cau: this.currentCau(20), sampleSize: model.n,
-        adaptive: model.adaptive,
-        regime: model.regime || null,
-        cauStructure: model.cauStructure || null,
-        profile: model.profile
+        Phien: row.session,
+        Ket_qua: result,
+        Xuc_xac_1: dice[0],
+        Xuc_xac_2: dice[1],
+        Xuc_xac_3: dice[2],
+        Tong: this.type === 'xocdia' ? null : row.sum,
+        dices: dice
+      };
+    }).filter(row => row.Ket_qua === 'Tài' || row.Ket_qua === 'Xỉu');
+
+    const historyAsc = this.history.map(row => ({
+      id: row.session,
+      resultTruyenThong: row.side === 'T' || row.side === 'CHAN' ? 'TAI' : row.side === 'X' || row.side === 'LE' ? 'XIU' : null,
+      dices: this.type === 'xocdia' ? [] : (Array.isArray(row.dice) ? row.dice : []),
+      point: this.type === 'xocdia' ? null : row.sum
+    })).filter(row => row.resultTruyenThong);
+
+    const learning = AlgorithmOnly.getAlgorithmLearningState(this.id);
+    const calculated = AlgorithmOnly.calculateAdvancedPrediction(dataDesc, this.id, {
+      historyAsc,
+      currentStreak: Number(learning.streakAnalysis && learning.streakAnalysis.currentStreak) || 0,
+      gameType: this.type,
+      diceModel: this.id.endsWith('/md5') ? 'md5' : 'hu',
+      allowRandomJitter: false,
+      includeExperimentalRandomSignal: false
+    });
+
+    if (!calculated || calculated.ready !== true || !calculated.prediction) {
+      return {
+        ready: false,
+        sampleSize,
+        requiredSamples: MIN_HISTORY_SESSIONS,
+        lyDo: calculated && calculated.lyDo || 'Thuật toán chưa đủ dữ liệu hợp lệ để dự đoán'
       };
     }
 
-    const model = modelProbability(this.history, this.type, this.id);
-    if (!model) {
-      return {
-        ready: false, sampleSize: this.validSampleCount(),
-        requiredSamples: MIN_HISTORY_SESSIONS,
-        lyDo: 'Chưa đủ dữ liệu lịch sử để chấm mô hình'
-      };
-    }
+    const algorithmSide = calculated.prediction === 'Tài' ? 'T' : 'X';
+    const side = this.type === 'xocdia'
+      ? (algorithmSide === 'T' ? 'CHAN' : 'LE')
+      : algorithmSide;
+    const translate = this.type === 'xocdia' ? translateParityText : value => value;
+    const translatedPatterns = (calculated.allPatterns || []).map(item => ({
+      ...item,
+      prediction: item.prediction ? translate(item.prediction) : item.prediction,
+      name: translate(item.name),
+      patternId: item.patternId || null
+    }));
+    const algorithmPatterns = translatedPatterns.filter(item => item.patternId);
+
     return {
-      side: model.side,
-      label: sideLabel(model.side),
-      conf: model.confidence,
-      pSide: model.pT,
+      ready: true,
+      side,
+      label: sideLabel(side),
+      conf: calculated.confidence,
+      pSide: calculated.confidence / 100,
+      vi: null,
+      topVi: [],
+      viDetails: [],
       topSums: [],
-      lyDo: model.lyDo,
+      lyDo: translate(calculated.lyDo || calculated.theCau || 'Phân tích chuỗi lịch sử bằng algorithm-only'),
       cau: this.currentCau(20),
-      sampleSize: model.n,
-      streak: model.run,
-      adaptive: model.adaptive,
-      regime: model.regime || null,
-      cauStructure: model.cauStructure || null,
-      profile: model.profile
+      cauStructure: null,
+      regime: null,
+      sampleSize: calculated.detailedAnalysis && calculated.detailedAnalysis.validSamples || sampleSize,
+      streak: Number(learning.streakAnalysis && learning.streakAnalysis.currentStreak) || 0,
+      adaptive: null,
+      profile: getModelProfile(this.id).name,
+      theCau: translate(calculated.theCau || ''),
+      khuyenNghi: calculated.khuyenNghi || (calculated.nenDanh ? 'ĐẸP - NÊN VÀO' : 'QUAN SÁT - CHỜ NHỊP'),
+      nenDanh: calculated.nenDanh === true,
+      algorithmVersion: AlgorithmOnly.ALGO_VERSION,
+      algorithmPatterns,
+      factors: (calculated.factors || []).map(translate),
+      detailedAnalysis: calculated.detailedAnalysis || null
     };
   }
+
 }
 
 /* ================================ STATE ================================== */
@@ -1412,6 +806,7 @@ function settlePredictionLogs(gameId, rows) {
   const logs = Array.isArray(predHistory[gameId]) ? predHistory[gameId] : [];
   const game = GAMES[gameId];
   let changed = false;
+  let algorithmUpdated = false;
   for (const log of logs) {
     if (!log || log.phien == null) continue;
     const actualRow = findSourceResult(rows, log.phien);
@@ -1465,8 +860,39 @@ function settlePredictionLogs(gameId, rows) {
     const wasSettled = log.ok === true || log.ok === false;
     Object.assign(log, next);
     if (!wasSettled || rowChanged || log.result_time == null) log.result_time = nowVN();
+
+    // Train the extracted algorithm exactly once after the actual result is valid.
+    // Xóc Đĩa maps Chẵn/Lẻ to the source algorithm's binary Tài/Xỉu alphabet only
+    // internally; the public API and stored game result remain Chẵn/Lẻ.
+    if (log.algorithm_learned !== true) {
+      const predictedForLearning = algorithmLabelFromSide(predictedSide, game.type);
+      const actualForLearning = algorithmLabelFromSide(actualRow.side, game.type);
+      if (predictedForLearning && actualForLearning) {
+        try {
+          const learned = AlgorithmOnly.learnFromSettledPrediction(gameId, {
+            prediction: predictedForLearning,
+            patterns: Array.isArray(log.algorithm_patterns) ? log.algorithm_patterns : [],
+            verified: false
+          }, actualForLearning);
+          if (learned && learned.updated) {
+            log.algorithm_learned = true;
+            log.algorithm_learned_at = new Date().toISOString();
+            log.algorithm_learning_result = {
+              isCorrect: learned.isCorrect,
+              updatedPatterns: learned.updatedPatterns || [],
+              recentAccuracy: learned.recentAccuracy
+            };
+            changed = true;
+            algorithmUpdated = true;
+          }
+        } catch (error) {
+          console.error('[ALGO-LEARNING]', gameId, log.phien, error.message);
+        }
+      }
+    }
   }
   if (changed) saveJSON('pred_history.json', predHistory);
+  if (algorithmUpdated) saveAlgorithmLearning();
   return changed;
 }
 
@@ -1640,7 +1066,7 @@ async function runPredictInternal(gameId) {
 
   // Warm-up applies independently to every game. Existing persisted source
   // sessions are reused; APIs that return only the current round accumulate
-  // distinct sessions through polling until five valid outcomes exist.
+  // distinct sessions through polling until the extracted algorithm minimum is met.
   if (sampleCount < MIN_HISTORY_SESSIONS) {
     const remaining = MIN_HISTORY_SESSIONS - sampleCount;
     lastStatus[gameId] = {
@@ -1656,7 +1082,8 @@ async function runPredictInternal(gameId) {
       Du_doan_side: null,
       do_tin_cay: null,
       Ly_do: `Đang thu thập dữ liệu riêng cho ${game.label}: đã có ${sampleCount}/${MIN_HISTORY_SESSIONS} phiên hợp lệ; chưa phát dự đoán`,
-      Model_profile: getModelProfile(gameId).name
+      Model_profile: getModelProfile(gameId).name,
+      Algorithm_version: AlgorithmOnly.ALGO_VERSION
     };
   }
 
@@ -1664,6 +1091,22 @@ async function runPredictInternal(gameId) {
   const existingLogs = Array.isArray(predHistory[gameId]) ? predHistory[gameId] : [];
   let log = existingLogs.find(item => String(item.phien) === String(nextSession));
   let pred;
+
+  // Do not keep an un-settled forecast produced by the removed PRED-API engine.
+  // Archive it for traceability, then compute this target session with algorithm-only.
+  if (log && log.algorithm_version !== AlgorithmOnly.ALGO_VERSION &&
+      log.ok == null && log.actual == null && log.actual_vi == null && log.actual_dice == null &&
+      log.risk_pause !== true && log.void !== true) {
+    const archive = loadJSON('superseded_predictions.json', []);
+    archive.unshift({ ...log, superseded_at: new Date().toISOString(),
+      superseded_reason: `Replaced by algorithm-only ${AlgorithmOnly.ALGO_VERSION}` });
+    if (archive.length > 2000) archive.length = 2000;
+    saveJSON('superseded_predictions.json', archive);
+    const staleIndex = existingLogs.indexOf(log);
+    if (staleIndex >= 0) existingLogs.splice(staleIndex, 1);
+    saveJSON('pred_history.json', predHistory);
+    log = null;
+  }
 
   if (log) {
     pred = predictionFromLog(log, game);
@@ -1705,6 +1148,9 @@ async function runPredictInternal(gameId) {
         top_vi: pred.topVi || [],
         top_sums: pred.topSums || [],
         model_profile: pred.profile || getModelProfile(gameId).name,
+        algorithm_version: pred.algorithmVersion || AlgorithmOnly.ALGO_VERSION,
+        algorithm_patterns: Array.isArray(pred.algorithmPatterns) ? pred.algorithmPatterns : [],
+        algorithm_factors: Array.isArray(pred.factors) ? pred.factors : [],
         training_sample_size: pred.sampleSize || sampleCount,
         actual: null,
         actual_side: null,
@@ -1724,6 +1170,7 @@ async function runPredictInternal(gameId) {
     Ly_do: pred.lyDo || 'Tổng hợp thống kê lịch sử riêng của game',
     Sample_size: pred.sampleSize || sampleCount,
     Model_profile: log.model_profile || getModelProfile(gameId).name,
+    Algorithm_version: log.algorithm_version || AlgorithmOnly.ALGO_VERSION,
     Consecutive_losses: pred.paused ? (log.loss_streak_before_pause || 3) : consecutiveLossState(gameId, nextSession).count,
     Trang_thai: pred.paused ? 'TAM_DUNG_BAO_VE' : 'DA_SAN_SANG',
     Is_ready: true,
@@ -1849,7 +1296,7 @@ function buildOverview() {
   const decided = totals.dung + totals.sai;
   totals.ti_le_dung = decided ? Math.round((totals.dung / decided) * 1000) / 10 : null;
   return {
-    id: IDOL, name: 'PRED-API', version: '4.1.2', time: nowVN(),
+    id: IDOL, name: 'PRED-API', version: '4.2.0', time: nowVN(),
     total_games: games.length,
     thong_ke_tong: totals,
     online: games.filter(game => game.status === 'online').length,
@@ -1875,7 +1322,7 @@ main{max-width:1120px;margin:0 auto;padding:24px 16px 40px}.top{display:flex;jus
 <header class="top"><div><div class="brand">PRED-API <span class="muted">/ v4.1.2</span></div><div class="sub">Tổng quan game · thống kê dự đoán · trạng thái dữ liệu</div></div><div class="stamp" id="updated">Đang tải…</div></header>
 <section class="summary" id="summary"><div class="metric"><div class="num">—</div><small>Đang tải dữ liệu</small></div></section>
 <div class="section">Danh sách game</div><section class="games" id="games"><div class="game muted">Đang tải danh sách game…</div></section>
-<div class="footer">Tỉ lệ đúng tính trên các phiên đã chốt trong lịch sử dự đoán đang lưu. Tối thiểu 5 phiên hợp lệ trước khi phát dự đoán.</div>
+<div class="footer">Tỉ lệ đúng tính trên các phiên đã chốt trong lịch sử dự đoán đang lưu. Tối thiểu 15 phiên hợp lệ trước khi phát dự đoán.</div>
 </main><script>
 const $=id=>document.getElementById(id);const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const statusText={online:'Đang chạy',learning:'Đang học',pending:'Chờ dữ liệu',protected:'Tạm dừng bảo vệ',error:'Lỗi API'};
@@ -1895,7 +1342,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, id: IDOL, version: '4.1.2', time: nowVN(), games: Object.keys(GAMES).length, min_history_sessions: MIN_HISTORY_SESSIONS });
+  res.json({ ok: true, id: IDOL, version: '4.2.0', time: nowVN(), games: Object.keys(GAMES).length, min_history_sessions: MIN_HISTORY_SESSIONS });
 });
 
 app.get('/games', (_req, res) => {
@@ -2067,7 +1514,7 @@ app.get('/:brand/:table', async (req, res) => {
 let server = null;
 if (require.main === module) {
   server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`PRED-API v4.1.2 on :${PORT}`);
+    console.log(`PRED-API v4.2.0 on :${PORT}`);
     console.log('Polling:', POLL_MS, 'ms');
     console.log('Games:', Object.keys(GAMES).join(', '));
   });
@@ -2077,11 +1524,10 @@ if (require.main === module) {
 module.exports = {
   app, GAMES, PARSERS, Engine, mergeSourceHistory,
   parseLc79List, parseLc79Xocdia, parseHitclub, parseMax789,
-  modelProbability, MODEL_PROFILES, getModelProfile,
+  getModelProfile, AlgorithmOnly, saveAlgorithmLearning,
   formatXocdia, redCountFromVi, sideLabel, sideFromSum, formatCauForApi,
   getSum, resolveTxOutcome,
   settlePredictionLogs, pushPredLog, formatHistoryRow, formatCompactHistoryRow, buildGameHistory, fetchGame, runPredict, expandEmbeddedCauRows,
   consecutiveLossState, getGamePredictionStats, buildOverview, DASHBOARD_HTML,
-  analyzeCauStructure, detectCycle, detectDaoPattern, detectCumPattern, cycleForecastRate, entropyOfSides, switchRate,
   _state: { engines, predHistory, lastStatus, sourceCache, recentOk }
 };
