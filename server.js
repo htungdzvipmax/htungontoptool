@@ -1,5 +1,5 @@
 /**
- * PRED-API v4.4.0 — compact prediction API / adaptive ensemble / Tài Xỉu / Xóc Đĩa đa game
+ * PRED-API v4.5.0 — compact prediction feed API / adaptive ensemble / Tài Xỉu / Xóc Đĩa đa game
  * Node >= 18 | Render: npm install && npm start
  *
  * Lưu ý: dữ liệu kết quả là ngẫu nhiên/được tạo bởi hệ thống game. Bộ phân tích
@@ -1127,14 +1127,15 @@ const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 const POLL_MS = Math.max(10000, Number(process.env.POLL_MS) || 25000);
 const SOURCE_LIMIT = Math.max(200, Number(process.env.SOURCE_LIMIT) || 1200);
-const PRED_LIMIT = Math.max(20, Number(process.env.PRED_HISTORY_LIMIT) || 50);
+const PRED_LIMIT = Math.max(100, Math.min(5000, Number(process.env.PRED_HISTORY_LIMIT) || 1000));
+const FEED_LIMIT = Math.max(100, Math.min(10000, Number(process.env.PREDICTION_FEED_LIMIT) || 3000));
 // The extracted algorithm requires at least 15 distinct, usable source sessions.
 const requestedMinHistory = Number(process.env.MIN_HISTORY_SESSIONS);
 const MIN_HISTORY_SESSIONS = Math.max(AlgorithmOnly.MIN_HISTORY, Number.isFinite(requestedMinHistory) && requestedMinHistory > 0 ? requestedMinHistory : AlgorithmOnly.MIN_HISTORY);
 const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-const IDOL = '@htungdzvipmax';
+const IDOL = String(process.env.API_ID || '@sewdangcap').trim() || '@sewdangcap';
 
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
@@ -1148,7 +1149,7 @@ const http = axios.create({
   }
 });
 
-/* Algorithm-only lõi v8.1 được nhúng trực tiếp trong server.js; không cần algorithm-only.js. */
+/* Algorithm-only lõi v8.2 được nhúng trực tiếp trong server.js; không cần algorithm-only.js. */
 
 /* ============================== GAME CONFIG ============================== */
 const GAMES = {
@@ -1228,6 +1229,18 @@ function saveJSON(file, data) {
   const temp = `${full}.tmp`;
   try {
     fs.writeFileSync(temp, JSON.stringify(data, null, 2), 'utf8');
+    fs.renameSync(temp, full);
+  } catch (error) {
+    console.error('[JSON-WRITE]', file, error.message);
+    try { if (fs.existsSync(temp)) fs.unlinkSync(temp); } catch (_) {}
+  }
+}
+
+function saveCompactJSON(file, data) {
+  const full = path.join(DATA_DIR, file);
+  const temp = `${full}.tmp`;
+  try {
+    fs.writeFileSync(temp, JSON.stringify(data), 'utf8');
     fs.renameSync(temp, full);
   } catch (error) {
     console.error('[JSON-WRITE]', file, error.message);
@@ -1876,6 +1889,9 @@ const engines = {};
 const predHistoryRaw = loadJSON('pred_history.json', {});
 const predHistory = predHistoryRaw && typeof predHistoryRaw === 'object' && !Array.isArray(predHistoryRaw)
   ? predHistoryRaw : {};
+const predictionFeedRaw = loadJSON('prediction_feed.json', {});
+const predictionFeedStore = predictionFeedRaw && typeof predictionFeedRaw === 'object' && !Array.isArray(predictionFeedRaw)
+  ? predictionFeedRaw : {};
 const lastStatus = {};
 const inFlight = new Map();
 // Lịch sử nguồn mới nhất (newest-first) của từng game, cập nhật sau mỗi lần tải thành công.
@@ -2184,6 +2200,7 @@ async function runPredictInternal(gameId) {
       ok: null, mode: 'learning', samples: sampleCount,
       required: MIN_HISTORY_SESSIONS, error: null, time: nowVN()
     };
+    persistPredictionFeed(gameId, rows);
     return {
       ...basePayload,
       Trang_thai: 'DANG_HOC_DU_LIEU',
@@ -2193,7 +2210,6 @@ async function runPredictInternal(gameId) {
       Du_doan_side: null,
       do_tin_cay: null,
       Du_doan_icon: '⏳',
-      Lich_su_du_doan: buildRecentPredictionRecords(gameId, 2),
       Algorithm_version: AlgorithmOnly.ALGO_VERSION
     };
   }
@@ -2222,6 +2238,14 @@ async function runPredictInternal(gameId) {
   }
 
   if (log) {
+    if (log.source_phien == null && String(nextSessionOf(latest)) === String(log.phien)) {
+      log.source_phien = latest.session == null ? null : String(latest.session);
+      log.source_result = latest.side ? sideLabel(latest.side) : (latest.sideSource === 'triple' ? 'Bộ ba' : null);
+      log.source_dice = Array.isArray(latest.dice) ? latest.dice : [];
+      log.source_vi = latest.vi || null;
+      if (!log.pattern) log.pattern = compactPatternLabel(log.the_cau || log.theCau);
+      saveJSON('pred_history.json', predHistory);
+    }
     pred = predictionFromLog(log, game);
   } else {
     const lossState = consecutiveLossState(gameId);
@@ -2256,6 +2280,11 @@ async function runPredictInternal(gameId) {
         pred_side: pred.side,
         conf: pred.conf,
         ly_do: pred.lyDo || null,
+        pattern: compactPatternLabel(pred.theCau),
+        source_phien: latest.session == null ? null : String(latest.session),
+        source_result: latest.side ? sideLabel(latest.side) : (latest.sideSource === 'triple' ? 'Bộ ba' : null),
+        source_dice: Array.isArray(latest.dice) ? latest.dice : [],
+        source_vi: latest.vi || null,
         cau: pred.cau || null,
         vi: pred.vi || null,
         top_vi: pred.topVi || [],
@@ -2281,7 +2310,6 @@ async function runPredictInternal(gameId) {
     Du_doan_side: pred.paused ? null : (game.type === 'xocdia' ? sideLabel(pred.side) : pred.side),
     do_tin_cay: pred.paused ? null : pred.conf,
     Du_doan_icon: pred.paused ? '⏸️' : '⏳',
-    Lich_su_du_doan: buildRecentPredictionRecords(gameId, 2),
     Sample_size: pred.sampleSize || sampleCount,
     Algorithm_version: log.algorithm_version || AlgorithmOnly.ALGO_VERSION,
     Consecutive_losses: pred.paused ? (log.loss_streak_before_pause || 3) : consecutiveLossState(gameId, nextSession).count,
@@ -2305,6 +2333,7 @@ async function runPredictInternal(gameId) {
     error: null,
     time: nowVN()
   };
+  persistPredictionFeed(gameId, rows);
   return payload;
 }
 
@@ -2373,7 +2402,7 @@ function getGamePredictionStats(gameId) {
 function buildOverview() {
   const games = Object.entries(GAMES).map(([id, game]) => {
     const status = lastStatus[id] || { ok: null, error: null, time: null };
-    const recent = buildRecentPredictionRecords(id, 2);
+    const recent = buildRecentPredictionRecords(id, 5);
     const latest = recent[0] || null;
     return {
       id: IDOL,
@@ -2390,7 +2419,7 @@ function buildOverview() {
       thong_ke: getGamePredictionStats(id),
       du_doan_hien_tai: latest ? latest.du_doan : null,
       du_doan_icon: latest ? latest.icon : '⏳',
-      ti_le_hien_tai: latest ? latest.ti_le : null,
+      ti_le_hien_tai: latest ? latest.do_tin_cay : null,
       recent_predictions: recent,
       predict: `/${id}`
     };
@@ -2406,7 +2435,7 @@ function buildOverview() {
   const decided = totals.dung + totals.sai;
   totals.ti_le_dung = decided ? Math.round((totals.dung / decided) * 1000) / 10 : null;
   return {
-    id: IDOL, name: 'PRED-API', version: '4.4.0', algorithm_version: AlgorithmOnly.ALGO_VERSION, time: nowVN(),
+    id: IDOL, name: 'PRED-API', version: '4.5.0', algorithm_version: AlgorithmOnly.ALGO_VERSION, time: nowVN(),
     total_games: games.length,
     thong_ke_tong: totals,
     online: games.filter(game => game.status === 'online').length,
@@ -2426,11 +2455,11 @@ const DASHBOARD_HTML = `<!doctype html>
 main{max-width:1440px;margin:0 auto;padding:24px 20px 42px}.top{display:flex;justify-content:space-between;align-items:center;gap:14px;margin-bottom:20px}.brand{font-size:22px;font-weight:750;letter-spacing:.2px}.version{font-size:11px;color:var(--muted);font-weight:500;margin-left:7px}.sub{font-size:12px;color:var(--muted);margin-top:3px}.topright{display:flex;align-items:center;gap:12px}.stamp{font-size:11px;color:var(--muted);text-align:right}.refresh{border:1px solid var(--line);background:var(--panel);color:var(--text);padding:8px 12px;border-radius:6px;cursor:pointer}.refresh:hover{border-color:#506477}
 .summary{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:9px}.metric{background:var(--panel);border:1px solid var(--line);padding:12px 13px;min-width:0;border-radius:7px}.num{font-size:22px;font-weight:750;font-variant-numeric:tabular-nums;white-space:nowrap}.metric small{display:block;color:var(--muted);font-size:11px;margin-top:3px}.sectionbar{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:24px 0 10px}.section{font-size:12px;color:var(--muted);font-weight:700;letter-spacing:.7px;text-transform:uppercase}.filters{display:flex;gap:5px;flex-wrap:wrap}.filter{background:transparent;border:1px solid var(--line);color:var(--muted);padding:5px 10px;border-radius:5px;font-size:11px;cursor:pointer}.filter.active{background:#263544;color:var(--text);border-color:#506477}
 .games{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:11px}.game{background:var(--panel);border:1px solid var(--line);border-radius:7px;padding:14px;min-width:0}.ghead{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}.gname{font-weight:700;font-size:14px;min-width:0}.gsub{font-size:10px;color:var(--muted);margin-top:3px}.status{flex:none;font-size:10px;border:1px solid var(--line);border-radius:4px;padding:3px 7px;color:var(--muted);white-space:nowrap}.status.online{color:var(--green);border-color:#345c4c}.status.learning,.status.pending{color:var(--amber);border-color:#655638}.status.error{color:var(--red);border-color:#6a4141}.status.protected{color:var(--blue);border-color:#425b74}
-.forecast{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px;margin-top:12px;background:var(--panel2);border:1px solid var(--line);border-radius:5px}.forecast-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.55px}.forecast-value{font-size:21px;font-weight:750;margin-top:2px}.confidence{text-align:right;font-variant-numeric:tabular-nums}.confidence b{font-size:18px}.confidence small{display:block;color:var(--muted);font-size:10px}.progress{height:4px;background:#293641;overflow:hidden;border-radius:4px;margin:12px 0 5px}.bar{height:100%;background:var(--blue)}.sample{display:flex;justify-content:space-between;gap:8px;color:var(--muted);font-size:10px}.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px;margin-top:13px}.stat{border-top:1px solid var(--line);padding-top:8px;min-width:0}.stat b{display:block;font-size:16px;font-variant-numeric:tabular-nums}.stat span{display:block;color:var(--muted);font-size:10px;margin-top:1px}.wins{color:var(--green)}.losses{color:var(--red)}.rate{color:var(--blue)}.recent{margin-top:12px;border-top:1px solid var(--line);padding-top:9px}.recent-title{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px}.record{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:5px 0;font-size:11px}.record+.record{border-top:1px solid rgba(42,55,67,.55)}.record-main{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.record-sub{color:var(--muted)}.mark{font-size:14px}.error-text{color:var(--red);font-size:10px;margin-top:9px;overflow-wrap:anywhere}.empty{padding:28px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:7px}.footer{margin-top:16px;color:var(--muted);font-size:10px;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.forecast{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px;margin-top:12px;background:var(--panel2);border:1px solid var(--line);border-radius:5px}.forecast-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.55px}.forecast-value{font-size:21px;font-weight:750;margin-top:2px}.confidence{text-align:right;font-variant-numeric:tabular-nums}.confidence b{font-size:18px}.confidence small{display:block;color:var(--muted);font-size:10px}.progress{height:4px;background:#293641;overflow:hidden;border-radius:4px;margin:12px 0 5px}.bar{height:100%;background:var(--blue)}.sample{display:flex;justify-content:space-between;gap:8px;color:var(--muted);font-size:10px}.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px;margin-top:13px}.stat{border-top:1px solid var(--line);padding-top:8px;min-width:0}.stat b{display:block;font-size:16px;font-variant-numeric:tabular-nums}.stat span{display:block;color:var(--muted);font-size:10px;margin-top:1px}.wins{color:var(--green)}.losses{color:var(--red)}.rate{color:var(--blue)}.recent{margin-top:12px;border-top:1px solid var(--line);padding-top:9px}.recent-title{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px}.record{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:5px 0;font-size:11px}.record+.record{border-top:1px solid rgba(42,55,67,.55)}.record-detail{min-width:0;flex:1}.record-main{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.record-pattern{display:block;color:var(--muted);font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.record-sub{color:var(--muted)}.mark{font-size:14px}.error-text{color:var(--red);font-size:10px;margin-top:9px;overflow-wrap:anywhere}.empty{padding:28px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:7px}.footer{margin-top:16px;color:var(--muted);font-size:10px;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
 @media(max-width:1100px){.summary{grid-template-columns:repeat(4,minmax(0,1fr))}.games{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:650px){main{padding:16px 11px 28px}.top{align-items:flex-start}.brand{font-size:19px}.topright{align-items:flex-end;flex-direction:column;gap:6px}.summary{grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.metric{padding:10px}.num{font-size:20px}.games{grid-template-columns:1fr;gap:8px}.game{padding:12px}.sectionbar{align-items:flex-start;flex-direction:column;margin-top:20px}.filters{width:100%}.filter{flex:1}.forecast{padding:10px}.forecast-value{font-size:20px}}
 </style></head><body><main>
-<header class="top"><div><div class="brand">PRED-API <span class="version">v4.4.0 · LIVE OVERVIEW</span></div><div class="sub">Toàn cảnh hệ thống · dự đoán · kết quả · độ chính xác</div></div><div class="topright"><div class="stamp" id="updated">Đang tải dữ liệu…</div><button class="refresh" id="refresh" type="button">↻ Làm mới</button></div></header>
+<header class="top"><div><div class="brand">PRED-API <span class="version">v4.5.0 · LIVE OVERVIEW</span></div><div class="sub">Toàn cảnh hệ thống · dự đoán · kết quả · độ chính xác</div></div><div class="topright"><div class="stamp" id="updated">Đang tải dữ liệu…</div><button class="refresh" id="refresh" type="button">↻ Làm mới</button></div></header>
 <section class="summary" id="summary"><div class="metric"><div class="num">—</div><small>Đang tải dữ liệu</small></div></section>
 <div class="sectionbar"><div class="section">Tình trạng từng game</div><div class="filters"><button class="filter active" data-filter="all">Tất cả</button><button class="filter" data-filter="online">Đang chạy</button><button class="filter" data-filter="learning">Đang học</button><button class="filter" data-filter="error">Lỗi API</button></div></div>
 <section class="games" id="games"><div class="empty">Đang tải danh sách game…</div></section>
@@ -2438,9 +2467,9 @@ main{max-width:1440px;margin:0 auto;padding:24px 20px 42px}.top{display:flex;jus
 </main><script>
 const $=id=>document.getElementById(id);const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const statusText={online:'Đang chạy',learning:'Đang học',pending:'Chờ dữ liệu',protected:'Tạm dừng',error:'Lỗi API'};let gamesCache=[];let activeFilter='all';
-function recordHtml(r){const status=r&&r.icon?r.icon:'⏳';const side=(r&&r.du_doan)||'Chưa có';const actual=(r&&r.thuc_te)?' · KQ '+r.thuc_te:'';const rate=(r&&r.ti_le!=null)?' · '+r.ti_le+'%':'';return '<div class="record"><span class="record-main">#'+esc(r&&r.phien)+' · '+esc(side)+actual+rate+'</span><b class="mark">'+status+'</b></div>';}
+function recordHtml(r){const status=r&&r.icon?r.icon:'⏳';const from=(r&&r.phien!=null)?'#'+r.phien:'—';const target=(r&&r.phien_du_doan!=null)?'#'+r.phien_du_doan:'—';const outcome=(r&&r.ket_qua)||'—';const side=(r&&r.du_doan)||'—';const rate=(r&&r.do_tin_cay)||'—';const pattern=(r&&r.pattern)||'Không rõ cầu';return '<div class="record"><div class="record-detail"><span class="record-main">'+esc(from)+' → '+esc(target)+' · '+esc(outcome)+' → '+esc(side)+' · '+esc(rate)+'</span><small class="record-pattern">'+esc(pattern)+'</small></div><b class="mark">'+status+'</b></div>'; }
 function render(){const selected=gamesCache.filter(g=>activeFilter==='all'||g.status===activeFilter||(activeFilter==='learning'&&g.status==='pending'));if(!selected.length){$('games').innerHTML='<div class="empty">Không có game thuộc bộ lọc này.</div>';return;}
-$('games').innerHTML=selected.map(g=>{const s=g.thong_ke||{};const n=Math.max(0,Math.min(100,100*Number(g.sample_size||0)/Math.max(1,Number(g.required_samples||15))));const recent=Array.isArray(g.recent_predictions)?g.recent_predictions:[];const prediction=g.du_doan_hien_tai||'Chưa sẵn sàng';const confidence=g.ti_le_hien_tai==null?'—':Number(g.ti_le_hien_tai)+'%';return '<article class="game"><div class="ghead"><div><div class="gname">'+esc(g.name)+'</div><div class="gsub">'+esc(g.game)+'</div></div><span class="status '+esc(g.status)+'">'+(statusText[g.status]||'Chưa rõ')+'</span></div><div class="forecast"><div><div class="forecast-label">Dự đoán mới nhất</div><div class="forecast-value">'+esc(prediction)+'</div></div><div class="confidence"><b>'+esc(confidence)+'</b><small>Chỉ số tín hiệu</small></div></div><div class="progress"><div class="bar" style="width:'+n+'%"></div></div><div class="sample"><span>Dữ liệu '+Number(g.sample_size||0)+' / '+Number(g.required_samples||15)+' phiên</span><span>'+g.du_doan_icon+'</span></div><div class="stats"><div class="stat"><b class="wins">'+Number(s.dung||0)+'</b><span>✅ Đúng</span></div><div class="stat"><b class="losses">'+Number(s.sai||0)+'</b><span>❌ Sai</span></div><div class="stat"><b>'+Number(s.dang_cho||0)+'</b><span>Chờ</span></div><div class="stat"><b class="rate">'+esc(s.ti_le||'—')+'</b><span>Tỉ lệ đúng</span></div></div><div class="recent"><div class="recent-title">2 dự đoán gần nhất</div>'+(recent.length?recent.map(recordHtml).join(''):'<div class="record"><span class="record-sub">Chưa có bản ghi</span><span>—</span></div>')+'</div>'+(g.error?'<div class="error-text">'+esc(g.error)+'</div>':'')+'</article>';}).join('');}
+$('games').innerHTML=selected.map(g=>{const s=g.thong_ke||{};const n=Math.max(0,Math.min(100,100*Number(g.sample_size||0)/Math.max(1,Number(g.required_samples||15))));const recent=Array.isArray(g.recent_predictions)?g.recent_predictions:[];const prediction=g.du_doan_hien_tai||'Chưa sẵn sàng';const confidence=g.ti_le_hien_tai||'—';return '<article class="game"><div class="ghead"><div><div class="gname">'+esc(g.name)+'</div><div class="gsub">'+esc(g.game)+'</div></div><span class="status '+esc(g.status)+'">'+(statusText[g.status]||'Chưa rõ')+'</span></div><div class="forecast"><div><div class="forecast-label">Dự đoán mới nhất</div><div class="forecast-value">'+esc(prediction)+'</div></div><div class="confidence"><b>'+esc(confidence)+'</b><small>Chỉ số tín hiệu</small></div></div><div class="progress"><div class="bar" style="width:'+n+'%"></div></div><div class="sample"><span>Dữ liệu '+Number(g.sample_size||0)+' / '+Number(g.required_samples||15)+' phiên</span><span>'+g.du_doan_icon+'</span></div><div class="stats"><div class="stat"><b class="wins">'+Number(s.dung||0)+'</b><span>✅ Đúng</span></div><div class="stat"><b class="losses">'+Number(s.sai||0)+'</b><span>❌ Sai</span></div><div class="stat"><b>'+Number(s.dang_cho||0)+'</b><span>Chờ</span></div><div class="stat"><b class="rate">'+esc(s.ti_le||'—')+'</b><span>Tỉ lệ đúng</span></div></div><div class="recent"><div class="recent-title">5 dự đoán gần nhất</div>'+(recent.length?recent.map(recordHtml).join(''):'<div class="record"><span class="record-sub">Chưa có bản ghi</span><span>—</span></div>')+'</div>'+(g.error?'<div class="error-text">'+esc(g.error)+'</div>':'')+'</article>';}).join('');}
 async function load(){const btn=$('refresh');btn.disabled=true;try{const r=await fetch('/overview',{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);const d=await r.json();$('updated').textContent='Cập nhật: '+(d.time||'—');const t=d.thong_ke_tong||{};const rate=t.ti_le_dung==null?'—':t.ti_le_dung+'%';const metrics=[[d.total_games||0,'Tổng game'],[d.online||0,'Đang chạy'],[d.learning||0,'Đang học'],[d.offline||0,'Lỗi API'],[t.tong||0,'Lượt dự đoán'],[t.dung||0,'Đúng'],[t.sai||0,'Sai'],[rate,'Tỉ lệ đúng']];$('summary').innerHTML=metrics.map(([v,l])=>'<div class="metric"><div class="num">'+esc(v)+'</div><small>'+l+'</small></div>').join('');gamesCache=Array.isArray(d.games)?d.games:[];render();}catch(e){$('updated').textContent='Không tải được dữ liệu';$('games').innerHTML='<div class="empty">Lỗi tải tổng quan: '+esc(e.message)+'</div>';}finally{btn.disabled=false;}}
 document.querySelectorAll('[data-filter]').forEach(btn=>btn.addEventListener('click',()=>{activeFilter=btn.dataset.filter;document.querySelectorAll('[data-filter]').forEach(el=>el.classList.toggle('active',el===btn));render();}));$('refresh').addEventListener('click',load);load();setInterval(load,15000);
 </script></body></html>`;
@@ -2453,7 +2482,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, id: IDOL, version: '4.4.0', time: nowVN(), games: Object.keys(GAMES).length, min_history_sessions: MIN_HISTORY_SESSIONS, algorithm_version: AlgorithmOnly.ALGO_VERSION });
+  res.json({ ok: true, id: IDOL, version: '4.5.0', time: nowVN(), games: Object.keys(GAMES).length, min_history_sessions: MIN_HISTORY_SESSIONS, algorithm_version: AlgorithmOnly.ALGO_VERSION });
 });
 
 app.get('/games', (_req, res) => {
@@ -2475,48 +2504,117 @@ app.get('/games', (_req, res) => {
 
 // Compact prediction log embedded in each prediction response. The source and
 // scoring logs stay private so the learning engine can retain its training data.
-function predictionTimestamp(value) {
+function compactPatternLabel(value) {
+  const text = String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
+  if (!text || text.length > 58 || /đang nạp lịch sử|chưa đủ dữ liệu/i.test(text)) return 'Không rõ cầu';
+  return text;
+}
+
+function sessionValue(value) {
   if (value == null || value === '') return null;
-  const normalized = normalizeTime(value);
-  if (normalized) return normalized;
-  const text = String(value).trim();
-  const vn = text.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4}),?\s+(\d{1,2}):(\d{2}):(\d{2})$/);
-  if (vn) {
-    const [, day, month, year, hour, minute, second] = vn;
-    const date = new Date(`${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}T${String(hour).padStart(2, '0')}:${minute}:${second}+07:00`);
-    return Number.isNaN(date.getTime()) ? null : date.toISOString();
+  const text = String(value);
+  return /^\d+$/.test(text) && Number.isSafeInteger(Number(text)) ? Number(text) : value;
+}
+
+function sourceRowForPrediction(entry, rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  if (entry && entry.source_phien != null) {
+    const match = list.find(row => String(row.session) === String(entry.source_phien));
+    if (match) return match;
+    return {
+      session: entry.source_phien,
+      side: parseKetQua(entry.source_result),
+      sideSource: entry.source_result === 'Bộ ba' ? 'triple' : 'stored',
+      dice: Array.isArray(entry.source_dice) ? entry.source_dice : [],
+      vi: entry.source_vi || null
+    };
+  }
+
+  const target = String(entry && entry.phien != null ? entry.phien : '');
+  const targetIndex = list.findIndex(row => String(row.session) === target);
+  if (targetIndex >= 0 && list[targetIndex + 1]) return list[targetIndex + 1];
+  if (list[0] && String(nextSessionOf(list[0])) === target) return list[0];
+
+  if (/^\d+$/.test(target)) {
+    try {
+      const previous = (BigInt(target) - 1n).toString();
+      return list.find(row => String(row.session) === previous) || null;
+    } catch (_) {}
   }
   return null;
 }
 
-function buildRecentPredictionRecords(gameId, limit = 2) {
+function compareFeedRows(a, b) {
+  const left = String(a && a.phien_du_doan != null ? a.phien_du_doan : '');
+  const right = String(b && b.phien_du_doan != null ? b.phien_du_doan : '');
+  if (/^\d+$/.test(left) && /^\d+$/.test(right)) {
+    try {
+      const aa = BigInt(left), bb = BigInt(right);
+      return aa > bb ? -1 : aa < bb ? 1 : 0;
+    } catch (_) {}
+  }
+  return right.localeCompare(left);
+}
+
+function buildPredictionFeedRecords(gameId, rows, limit = FEED_LIMIT) {
+  const game = GAMES[gameId] || { type: 'tx' };
+  const stored = Array.isArray(predictionFeedStore[gameId]) ? predictionFeedStore[gameId] : [];
+  const byTarget = new Map();
+  for (const record of stored) {
+    if (record && record.phien_du_doan != null && Object.prototype.hasOwnProperty.call(record, 'xuc_xac')) {
+      byTarget.set(String(record.phien_du_doan), record);
+    }
+  }
+
   const logs = Array.isArray(predHistory[gameId]) ? predHistory[gameId] : [];
-  const count = Math.max(0, Math.min(2, Number(limit) || 2));
-  return logs.slice(0, count).filter(entry => entry && entry.phien != null).map(entry => {
-    let trangThai = null;
+  for (const entry of logs) {
+    if (!entry || entry.phien == null || entry.risk_pause === true || !entry.du_doan) continue;
+    const source = sourceRowForPrediction(entry, rows);
+    const sourceResult = entry.source_result || (source && source.side
+      ? sideLabel(source.side)
+      : source && source.sideSource === 'triple' ? 'Bộ ba' : null);
+    const sourceDice = Array.isArray(entry.source_dice) && entry.source_dice.length
+      ? entry.source_dice
+      : source && Array.isArray(source.dice) ? source.dice : [];
+    const confidence = Number(entry.conf);
     let icon = '⏳';
-    if (entry.risk_pause === true) { trangThai = 'S'; icon = '⏸️'; }
-    else if (entry.void === true) { trangThai = 'P'; icon = '➖'; }
-    else if (entry.ok === true) { trangThai = 'W'; icon = '✅'; }
-    else if (entry.ok === false) { trangThai = 'X'; icon = '❌'; }
-    const phienText = String(entry.phien);
-    const phienNumber = /^\d+$/.test(phienText) && Number.isSafeInteger(Number(phienText))
-      ? Number(phienText) : entry.phien;
+    if (entry.void === true) icon = '➖';
+    else if (entry.ok === true) icon = '✅';
+    else if (entry.ok === false) icon = '❌';
+
     const record = {
-      phien: phienNumber,
-      du_doan: entry.du_doan || null,
-      thuc_te: entry.actual == null ? null : entry.actual,
-      trang_thai: trangThai,
-      ti_le: entry.conf == null || !Number.isFinite(Number(entry.conf)) ? null : Number(entry.conf),
-      timestamp: predictionTimestamp(entry.time || entry.created_at || entry.result_time),
+      id: IDOL,
+      phien: sessionValue(entry.source_phien != null ? entry.source_phien : (source && source.session)),
+      ket_qua: sourceResult,
+      xuc_xac: sourceDice,
+      phien_du_doan: sessionValue(entry.phien),
+      du_doan: entry.du_doan,
+      do_tin_cay: Number.isFinite(confidence) ? `${Number.isInteger(confidence) ? confidence : Number(confidence.toFixed(1))}%` : null,
+      pattern: compactPatternLabel(entry.pattern || entry.the_cau || entry.theCau),
       icon
     };
-    const errorClass = entry.phan_loai_sai || entry.error_class;
-    if (entry.ok === false && typeof errorClass === 'string' && errorClass.trim()) {
-      record.phan_loai_sai = errorClass.trim();
+    // Keep the output schema identical across game types. Xóc Đĩa uses its
+    // four red/white pieces in xuc_xac; TX games use their three dice values.
+    if (game.type === 'xocdia' && !record.xuc_xac.length && source && source.vi) {
+      record.xuc_xac = [source.vi];
     }
-    return record;
-  });
+    byTarget.set(String(entry.phien), record);
+  }
+
+  const sorted = Array.from(byTarget.values()).sort(compareFeedRows);
+  const count = Math.max(0, Math.min(FEED_LIMIT, Number(limit) || FEED_LIMIT));
+  return sorted.slice(0, count);
+}
+
+function persistPredictionFeed(gameId, rows) {
+  predictionFeedStore[gameId] = buildPredictionFeedRecords(gameId, rows, FEED_LIMIT);
+  saveCompactJSON('prediction_feed.json', predictionFeedStore);
+  return predictionFeedStore[gameId];
+}
+
+function buildRecentPredictionRecords(gameId, limit = 5) {
+  const rows = sourceCache[gameId] || loadJSON(sourceFile(gameId), []);
+  return buildPredictionFeedRecords(gameId, rows, limit);
 }
 
 app.get('/:brand/:table', async (req, res) => {
@@ -2525,8 +2623,9 @@ app.get('/:brand/:table', async (req, res) => {
     return res.status(404).json({ ok: false, error: 'Game không tồn tại', tip: 'Xem GET / hoặc GET /games' });
   }
   try {
-    const data = await runPredict(gameId);
-    res.json(data);
+    await runPredict(gameId);
+    const records = persistPredictionFeed(gameId, sourceCache[gameId] || []);
+    res.set('Cache-Control', 'no-store').json(records);
   } catch (error) {
     console.error('[PREDICT]', gameId, error.message);
     res.status(502).json({
@@ -2544,7 +2643,7 @@ app.get('/:brand/:table', async (req, res) => {
 let server = null;
 if (require.main === module) {
   server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`PRED-API v4.4.0 on :${PORT}`);
+    console.log(`PRED-API v4.5.0 on :${PORT}`);
     console.log('Polling:', POLL_MS, 'ms');
     console.log('Games:', Object.keys(GAMES).join(', '));
   });
@@ -2557,7 +2656,7 @@ module.exports = {
   getModelProfile, AlgorithmOnly, saveAlgorithmLearning,
   formatXocdia, redCountFromVi, sideLabel, sideFromSum, formatCauForApi,
   getSum, resolveTxOutcome,
-  settlePredictionLogs, pushPredLog, buildRecentPredictionRecords, fetchGame, runPredict, expandEmbeddedCauRows,
+  settlePredictionLogs, pushPredLog, buildRecentPredictionRecords, buildPredictionFeedRecords, persistPredictionFeed, fetchGame, runPredict, expandEmbeddedCauRows,
   consecutiveLossState, getGamePredictionStats, buildOverview, DASHBOARD_HTML,
-  _state: { engines, predHistory, lastStatus, sourceCache, recentOk }
+  _state: { engines, predHistory, predictionFeedStore, lastStatus, sourceCache, recentOk }
 };
