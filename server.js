@@ -1,1990 +1,696 @@
-/**
- * PRED-API v4.0 — Tài Xỉu / Xóc Đĩa đa game
- * Node >= 18 | Render: npm install && npm start
- *
- * Lưu ý: dữ liệu kết quả là ngẫu nhiên/được tạo bởi hệ thống game. Bộ phân tích
- * chỉ thống kê và kiểm định các mẫu lịch sử, không thể bảo đảm dự đoán đúng.
- */
 'use strict';
 
-const express = require('express');
-const axios = require('axios');
-const cors = require('cors');
-const fs = require('fs');
-const path = require('path');
-
-const app = express();
-const PORT = Number(process.env.PORT) || 3000;
-const POLL_MS = Math.max(10000, Number(process.env.POLL_MS) || 25000);
-const SOURCE_LIMIT = Math.max(200, Number(process.env.SOURCE_LIMIT) || 1200);
-const PRED_LIMIT = Math.max(20, Number(process.env.PRED_HISTORY_LIMIT) || 50);
-// Never emit a forecast from fewer than five distinct, usable source sessions.
-const MIN_HISTORY_SESSIONS = Math.max(5, Number(process.env.MIN_HISTORY_SESSIONS) || 5);
-const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, 'data');
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-
-const IDOL = '@htungdzvipmax';
-
-app.use(cors());
-app.use(express.json({ limit: '1mb' }));
-app.set('json spaces', 2);
-
-const http = axios.create({
-  timeout: 15000,
-  headers: {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-    Accept: 'application/json, text/plain, */*'
-  }
-});
-
-/* ============================== GAME CONFIG ============================== */
-const GAMES = {
-  'lc79/tx': {
-    label: 'LC79 Tài Xỉu', type: 'tx',
-    url: 'https://wtx.tele68.com/v1/tx/lite-sessions?cp=R&cl=R&pf=web&at=',
-    parser: 'lc79List'
-  },
-  'lc79/md5': {
-    label: 'LC79 MD5', type: 'tx',
-    url: 'https://wtxmd52.tele68.com/v1/txmd5/sessions',
-    parser: 'lc79List'
-  },
-  'lc79/xocdia': {
-    label: 'LC79 Xóc Đĩa', type: 'xocdia',
-    url: 'https://wcl.tele68.com/v1/chanlefull/lite-sessions',
-    parser: 'lc79Xocdia'
-  },
-  'betvip/tx': {
-    label: 'BETVIP Tài Xỉu', type: 'tx',
-    url: 'https://wtx.macminim6.online/v1/tx/sessions',
-    parser: 'lc79List'
-  },
-  'betvip/md5': {
-    label: 'BETVIP MD5', type: 'tx',
-    url: 'https://wtxmd52.macminim6.online/v1/txmd5/sessions',
-    parser: 'lc79List'
-  },
-  'max789/tx': {
-    label: 'MAX789 Tài Xỉu', type: 'tx',
-    url: 'https://taixiu.maksh3979madfw.com/api/luckydice/GetSoiCau',
-    parser: 'max789'
-  },
-  'max789/md5': {
-    label: 'MAX789 MD5', type: 'tx',
-    url: 'https://taixiumd5.maksh3979madfw.com/api/md5luckydice/GetSoiCau',
-    parser: 'max789'
-  },
-  'max789/kubet': {
-    label: 'MAX789 Kubet Live', type: 'tx',
-    url: 'https://txkubet.maksh3979madfw.com/api/taixiukubet/GetSoiCau',
-    parser: 'max789'
-  },
-  'hitclub/tx': {
-    label: 'HITCLUB Tài Xỉu', type: 'tx',
-    url: 'https://apihitclubhihi.onrender.com/api/hitclub/hu',
-    parser: 'hitclub'
-  },
-  'hitclub/md5': {
-    label: 'HITCLUB MD5', type: 'tx',
-    url: 'https://apihitclubhihi.onrender.com/api/hitclub/md5',
-    parser: 'hitclub'
-  }
-};
-
-/* ================================ STORAGE ================================ */
-function loadJSON(file, fallback) {
-  const full = path.join(DATA_DIR, file);
-  try {
-    if (!fs.existsSync(full)) return fallback;
-    const value = JSON.parse(fs.readFileSync(full, 'utf8'));
-    return value == null ? fallback : value;
-  } catch (error) {
-    console.error('[JSON-READ]', file, error.message);
-    // Không để lần ghi kế tiếp đè mất dữ liệu: giữ bản hỏng để khôi phục thủ công.
-    try {
-      if (fs.existsSync(full)) fs.renameSync(full, `${full}.corrupt-${Date.now()}`);
-    } catch (renameError) {
-      console.error('[JSON-BACKUP]', file, renameError.message);
-    }
-    return fallback;
-  }
-}
-
-function saveJSON(file, data) {
-  const full = path.join(DATA_DIR, file);
-  const temp = `${full}.tmp`;
-  try {
-    fs.writeFileSync(temp, JSON.stringify(data, null, 2), 'utf8');
-    fs.renameSync(temp, full);
-  } catch (error) {
-    console.error('[JSON-WRITE]', file, error.message);
-    try { if (fs.existsSync(temp)) fs.unlinkSync(temp); } catch (_) {}
-  }
-}
-
-function safeFilePart(value) {
-  return String(value).replace(/[^a-z0-9_-]/gi, '_');
-}
-
-function nowVN() {
-  return new Date().toLocaleString('vi-VN', {
-    timeZone: 'Asia/Ho_Chi_Minh', hour12: false
-  });
-}
-
-function makeModelProfile(name, options = {}) {
-  return {
-    name,
-    shortWindow: options.shortWindow || 12,
-    mediumWindow: options.mediumWindow || 35,
-    longWindow: options.longWindow || 80,
-    ewmaAlpha: options.ewmaAlpha || 0.10,
-    markovPriors: options.markovPriors || [8, 12, 16],
-    patternMaxOrder: options.patternMaxOrder || 6,
-    patternMinMatches: options.patternMinMatches || 2,
-    patternPrior: options.patternPrior || 7,
-    runPrior: options.runPrior || 8,
-    sumBandPrior: options.sumBandPrior || 10,
-    diceMaxReliability: options.diceMaxReliability || 0.45,
-    evalWindow: options.evalWindow || 55,
-    backtestMin: options.backtestMin || 12,
-    weights: options.weights || {}
-  };
-}
-
-/* ================================ HELPERS ================================ */
-function normText(value) {
-  // Phải thay cả "Đ" hoa trước khi chuyển thường: toLowerCase() biến "Đ" thành "đ"
-  // (không còn khớp), làm "Đỏ" thành "đo" và bị bỏ qua khi nhận diện màu.
-  return String(value == null ? '' : value)
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[Đđ]/g, 'd')
-    .toLowerCase()
-    .trim();
-}
-
-function firstValue(obj, keys) {
-  if (!obj || typeof obj !== 'object') return undefined;
-  for (const key of keys) {
-    if (obj[key] !== undefined && obj[key] !== null && obj[key] !== '') return obj[key];
-  }
-  return undefined;
-}
-
-function toNumber(value) {
-  if (value === null || value === undefined || value === '') return null;
-  const n = Number(value);
-  return Number.isFinite(n) ? n : null;
-}
-
-function sumArray(values) {
-  return values.reduce((sum, value) => sum + (Number(value) || 0), 0);
-}
-
-function parseKetQua(value) {
-  const s = normText(value);
-  if (!s) return null;
-  if (s === 't' || s.includes('tai')) return 'T';
-  if (s === 'x' || s.includes('xiu')) return 'X';
-  if (s === 'c' || s.includes('chan')) return 'CHAN';
-  if (s === 'l' || s === 'le' || s.includes('le ')) return 'LE';
-  if (s.includes('odd')) return 'LE';
-  if (s.includes('even')) return 'CHAN';
-  return null;
-}
-
-function sideFromSum(sum) {
-  const value = Number(sum);
-  if (!Number.isInteger(value) || value < 3 || value > 18) return null;
-  // Với luật 3 xúc xắc phổ biến, tổng 3 hoặc 18 là bộ ba, không xếp Tài/Xỉu.
-  if (value === 3 || value === 18) return null;
-  return value >= 11 ? 'T' : 'X';
-}
-
-function isTriple(dice) {
-  return Array.isArray(dice) && dice.length === 3 &&
-    dice.every(value => Number.isInteger(Number(value))) &&
-    Number(dice[0]) === Number(dice[1]) && Number(dice[1]) === Number(dice[2]);
-}
-
-function sideLabel(side) {
-  if (side === 'T') return 'Tài';
-  if (side === 'X') return 'Xỉu';
-  if (side === 'CHAN') return 'Chẵn';
-  if (side === 'LE') return 'Lẻ';
-  return side || null;
-}
-
-function isNumericSession(value) {
-  return /^-?\d+$/.test(String(value == null ? '' : value).trim());
-}
-
-function getSession(row) {
-  const value = firstValue(row, [
-    'session', 'Session', 'phien', 'Phien', 'sessionId', 'SessionId',
-    'gameNum', 'GameNum', 'id', 'ID', '_id', 'issue', 'issueNo', 'round', 'roundId'
-  ]);
-  return value == null ? '' : String(value).replace(/^#/, '').trim();
-}
-
-function getRows(raw, depth = 0) {
-  if (Array.isArray(raw)) return raw;
-  if (!raw || typeof raw !== 'object' || depth > 4) return [];
-  const preferred = [
-    'list', 'resultList', 'sessions', 'items', 'rows', 'history',
-    'records', 'results', 'dataList', 'sessionList', 'gameList'
-  ];
-  let emptyArray = null;
-  for (const key of preferred) {
-    if (Array.isArray(raw[key])) {
-      if (raw[key].length) return raw[key];
-      emptyArray = raw[key];
-    }
-  }
-  if (Array.isArray(raw.data) && raw.data.length) return raw.data;
-  if (Array.isArray(raw.data) && !emptyArray) emptyArray = raw.data;
-  for (const key of ['data', 'result', 'payload', 'response']) {
-    if (raw[key] && typeof raw[key] === 'object') {
-      const found = getRows(raw[key], depth + 1);
-      if (found.length) return found;
-    }
-  }
-  // Nhiều API trả trực tiếp một kết quả thay vì mảng.
-  if (getSession(raw) || raw.phien_truoc != null || raw.Phien_truoc != null) return [raw];
-  return emptyArray || [];
-}
-
-function getDice(row) {
-  let value = firstValue(row, [
-    'dices', 'Dices', 'dice', 'Dice', 'xuc_xac', 'Xuc_xac',
-    'facesList', 'FacesList', 'diceList', 'DiceList'
-  ]);
-  if (!Array.isArray(value) && typeof value === 'string') {
-    value = value.split(/[\s,;|/-]+/).filter(Boolean);
-  }
-  if (!Array.isArray(value)) {
-    const keys = [
-      ['Xuc_xac_1', 'Xuc_xac_2', 'Xuc_xac_3'],
-      ['xuc_xac_1', 'xuc_xac_2', 'xuc_xac_3'],
-      ['FirstDice', 'SecondDice', 'ThirdDice'],
-      ['firstDice', 'secondDice', 'thirdDice']
-    ];
-    for (const trio of keys) {
-      if (trio.some(k => row && row[k] !== undefined && row[k] !== null)) {
-        value = trio.map(k => row[k]).filter(v => v !== undefined && v !== null);
-        break;
-      }
-    }
-  }
-  if (!Array.isArray(value)) return [];
-  return value.map(v => {
-    if (v && typeof v === 'object') {
-      return firstValue(v, ['value', 'face', 'name', 'color', 'result']) ?? '';
-    }
-    return v;
-  });
-}
-
-function getReportedSum(row) {
-  const raw = firstValue(row, ['sum', 'Sum', 'tong', 'Tong', 'point', 'Point', 'DiceSum', 'score', 'Score']);
-  const parsed = toNumber(raw);
-  return Number.isInteger(parsed) && parsed >= 3 && parsed <= 18 ? parsed : null;
-}
-
-function normalizeDiceNumbers(dice) {
-  return (Array.isArray(dice) ? dice : []).map(toNumber)
-    .filter(n => n !== null && Number.isInteger(n) && n >= 1 && n <= 6);
-}
-
-function getSum(row, dice) {
-  const numbers = normalizeDiceNumbers(dice);
-  // Nếu API gửi đủ 3 mặt xúc xắc, tổng tự tính là nguồn có thể kiểm chứng nhất.
-  if (numbers.length === 3 && Array.isArray(dice) && dice.length === 3) return sumArray(numbers);
-  return getReportedSum(row);
-}
-
-function resolveTxOutcome(row, dice, sum) {
-  const declared = parseKetQua(firstValue(row, [
-    'resultTruyenThong', 'ResultTruyenThong', 'ket_qua', 'Ket_qua',
-    'result', 'Result', 'side', 'Side', 'name', 'Name'
-  ]));
-  const validDice = Array.isArray(dice) && dice.length === 3 && dice.every(n => Number.isInteger(n) && n >= 1 && n <= 6);
-  const triple = validDice ? isTriple(dice) : (sum === 3 || sum === 18);
-  const sourceSum = validDice ? sumArray(dice) : sum;
-  let side = null;
-  let sideSource = 'missing';
-  if (triple) {
-    sideSource = 'triple';
-  } else if (sourceSum !== null && sourceSum !== undefined) {
-    side = sideFromSum(sourceSum);
-    sideSource = validDice ? 'dice_sum' : 'reported_sum';
-  } else if (declared === 'T' || declared === 'X') {
-    side = declared;
-    sideSource = 'declared';
-  }
-
-  const reportedSum = getReportedSum(row);
-  const warnings = [];
-  if (validDice && reportedSum !== null && reportedSum !== sourceSum) {
-    warnings.push(`Tong API ${reportedSum} lệch tổng xúc xắc ${sourceSum}`);
-  }
-  if (declared === 'T' || declared === 'X') {
-    if (triple) warnings.push(`Ket_qua API ${sideLabel(declared)} nhưng xúc xắc là bộ ba`);
-    else if (side && declared !== side) warnings.push(`Ket_qua API ${sideLabel(declared)} lệch kết quả tính từ xúc xắc ${sideLabel(side)}`);
-  }
-  return {
-    side,
-    sideSource,
-    declaredSide: declared === 'T' || declared === 'X' ? declared : null,
-    reportedSum,
-    dataWarning: warnings.length ? warnings.join('; ') : null
-  };
-}
-
-
-function normalizeTime(value) {
-  if (value === undefined || value === null || value === '') return null;
-  const numeric = Number(value);
-  let date;
-  if (Number.isFinite(numeric)) {
-    date = new Date(numeric > 0 && numeric < 100000000000 ? numeric * 1000 : numeric);
-  } else {
-    const text = String(value).trim();
-    // MAX789 có lúc trả `HH:mm:ss DD/MM/YYYY`; diễn giải theo giờ Việt Nam.
-    const vn = text.match(/^(\d{1,2}):(\d{2}):(\d{2})\s+(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-    if (vn) {
-      const [, hh, mm, ss, dd, month, year] = vn;
-      date = new Date(`${year}-${String(month).padStart(2, '0')}-${String(dd).padStart(2, '0')}T${hh.padStart(2, '0')}:${mm}:${ss}+07:00`);
-    } else {
-      date = new Date(text);
-    }
-  }
-  return Number.isNaN(date.getTime()) ? null : date.toISOString();
-}
-
-/* =============================== XÓC ĐĨA ================================ */
-function normalizeColor(value) {
-  const s = normText(value);
-  if (!s) return null;
-  if (s.includes('trang') || s.includes('white') || s === 'w') return 'trang';
-  if (s.includes('do') || s.includes('red') || s === 'r') return 'do';
-  return null;
-}
-
-function redCountFromVi(value) {
-  const s = normText(value).replace(/[_-]/g, ' ');
-  if (!s) return null;
-  const digit = s.match(/\b([0-4])\b/);
-  const wordMap = { zero: 0, one: 1, two: 2, three: 3, four: 4, mot: 1, hai: 2, ba: 3, bon: 4 };
-  let count = digit ? Number(digit[1]) : null;
-  if (count === null) {
-    for (const [word, num] of Object.entries(wordMap)) {
-      if (new RegExp(`\\b${word}\\b`).test(s)) { count = num; break; }
-    }
-  }
-  if (count === null) return null;
-  const redMatch = s.match(/([0-4])\s*(do|red)/);
-  if (redMatch) return Number(redMatch[1]);
-  const isWhite = s.includes('trang') || s.includes('white');
-  const isRed = s.includes('do') || s.includes('red');
-  if (isWhite && !isRed) count = 4 - count;
-  if (isRed || isWhite) return count;
-  // Chuỗi chỉ có số, không có màu: không tự đoán màu.
-  return null;
-}
-
-function formatXocdia(redCount) {
-  if (!Number.isInteger(redCount) || redCount < 0 || redCount > 4) return null;
-  return `${redCount} đỏ - ${4 - redCount} trắng`;
-}
-
-function parseXocdiaRow(row) {
-  const rawDice = getDice(row);
-  const dice = rawDice.map(v => normalizeColor(v) || String(v));
-  const colors = rawDice.map(normalizeColor).filter(Boolean);
-  let redCount = rawDice.length === 4 && colors.length === 4 ? colors.filter(c => c === 'do').length : null;
-  const rawVi = firstValue(row, ['resultVi', 'ResultVi', 'vi', 'Vi', 'result_vi', 'pattern', 'Pattern']);
-  if (redCount === null) redCount = redCountFromVi(rawVi);
-  const whiteCount = redCount === null ? null : 4 - redCount;
-  const declaredSide = parseKetQua(firstValue(row, [
-    'resultTruyenThong', 'ResultTruyenThong', 'ket_qua', 'Ket_qua', 'result', 'Result', 'side', 'Side'
-  ]));
-  const derivedSide = redCount === null ? null : (redCount % 2 === 0 ? 'CHAN' : 'LE');
-  const side = derivedSide || (declaredSide === 'CHAN' || declaredSide === 'LE' ? declaredSide : null);
-  const dataWarning = derivedSide && (declaredSide === 'CHAN' || declaredSide === 'LE') && derivedSide !== declaredSide
-    ? `Kết quả API ${sideLabel(declaredSide)} lệch mẫu màu ${formatXocdia(redCount)}` : null;
-  return {
-    session: getSession(row),
-    side,
-    sideSource: derivedSide ? 'derived_color' : side ? 'declared' : 'missing',
-    dataWarning,
-    dice,
-    doCount: redCount,
-    trangCount: whiteCount,
-    vi: formatXocdia(redCount),
-    time: normalizeTime(firstValue(row, ['time', 'Time', 'createdAt', 'CreatedAt', 'timestamp']))
-  };
-}
-
-/* ================================= PARSERS ================================ */
-function parseTxRow(row, timeKeys = []) {
-  const rawDice = getDice(row);
-  const dice = normalizeDiceNumbers(rawDice);
-  const validDice = rawDice.length === 3 && dice.length === 3;
-  const sum = validDice ? sumArray(dice) : getReportedSum(row);
-  const outcome = resolveTxOutcome(row, validDice ? dice : [], sum);
-  const time = normalizeTime(firstValue(row, timeKeys.length ? timeKeys : [
-    'time', 'Time', 'createdAt', 'CreatedAt', 'timestamp', 'CreatedDate', 'createdDate'
-  ]));
-  return {
-    session: getSession(row), dice: validDice ? dice : [], sum,
-    side: outcome.side, sideSource: outcome.sideSource,
-    declaredSide: outcome.declaredSide, reportedSum: outcome.reportedSum,
-    dataWarning: outcome.dataWarning, time,
-    nextSession: firstValue(row, ['nextSession', 'next_session', 'phien_hien_tai', 'Phien_tiep']) || null,
-    cau: firstValue(row, ['Cau_hien_tai', 'cau_hien_tai', 'currentCau', 'current_cau']) || null,
-    apiSampleSize: toNumber(firstValue(row, ['Sample_size', 'sample_size', 'sampleSize']))
-  };
-}
-
-function parseLc79List(raw) {
-  return getRows(raw).map(row => parseTxRow(row))
-    .filter(row => row.session);
-}
-
-function parseLc79Xocdia(raw) {
-  return getRows(raw).map(parseXocdiaRow).filter(row => row.session);
-}
-
-function parseMax789(raw) {
-  return getRows(raw).map(row => parseTxRow(row, ['CreatedDate', 'createdDate', 'time', 'Time']))
-    .filter(row => row.session);
-}
-
-function parseHitclub(raw) {
-  return getRows(raw).map(row => parseTxRow(row, ['time', 'Time', 'createdAt', 'CreatedAt']))
-    .filter(row => row.session);
-}
-
-const PARSERS = {
-  lc79List: parseLc79List,
-  lc79Xocdia: parseLc79Xocdia,
-  max789: parseMax789,
-  hitclub: parseHitclub
-};
-
-/* ======================= SOURCE HISTORY (HỌC NGẦM) ======================= */
-// Lịch sử thô đã chuẩn hóa được lưu riêng trong source_*.json, không trả ra
-// endpoint history của người dùng. Mỗi game tự học trên dữ liệu nguồn của mình.
-function sourceFile(gameId) {
-  return `source_${safeFilePart(gameId)}.json`;
-}
-
-function sourceSideQuality(row) {
-  if (!row) return 0;
-  const source = row.sideSource;
-  if (source === 'dice_sum' || source === 'derived_color' || source === 'triple') return 3;
-  if (source === 'reported_sum') return 2;
-  if (source === 'declared') return 1;
-  if (source === 'embedded_cau' || source === 'missing') return 0;
-  // Compatibility with source files saved by v1/v2 before sideSource was stored.
-  if (Array.isArray(row.dice) && (row.dice.length === 3 || row.dice.length === 4)) return 3;
-  if ((row.sum !== null && row.sum !== undefined && Number.isFinite(Number(row.sum))) ||
-      (row.doCount !== null && row.doCount !== undefined && Number.isFinite(Number(row.doCount)))) return 2;
-  return row.side ? 1 : 0;
-}
-
-function compareSourceRows(a, b) {
-  if (isNumericSession(a.session) && isNumericSession(b.session)) {
-    const aa = BigInt(String(a.session));
-    const bb = BigInt(String(b.session));
-    return aa < bb ? -1 : aa > bb ? 1 : 0;
-  }
-  const ta = a.time ? Date.parse(a.time) : NaN;
-  const tb = b.time ? Date.parse(b.time) : NaN;
-  if (Number.isFinite(ta) && Number.isFinite(tb)) return ta - tb;
-  return (Number(a._order) || 0) - (Number(b._order) || 0);
-}
-
-function mergeSourceHistory(gameId, incomingRows) {
-  const previous = loadJSON(sourceFile(gameId), []);
-  const store = Array.isArray(previous) ? previous : [];
-  const map = new Map();
-  let order = 0;
-  for (const row of store) {
-    if (!row || !row.session) continue;
-    const item = { ...row, _order: Number(row._order) || ++order };
-    map.set(String(item.session), item);
-    order = Math.max(order, item._order);
-  }
-
-  // API phổ biến trả phiên mới nhất trước. Đảo lại khi thêm để giữ thứ tự cũ → mới.
-  const rows = Array.isArray(incomingRows) ? incomingRows : [];
-  for (const row of [...rows].reverse()) {
-    if (!row || !row.session) continue;
-    const key = String(row.session);
-    const old = map.get(key);
-    const merged = { ...(old || {}), session: key };
-    const incomingQuality = sourceSideQuality(row);
-    const oldQuality = sourceSideQuality(old);
-    const acceptOutcome = !old || incomingQuality >= oldQuality;
-    for (const [field, value] of Object.entries(row)) {
-      if (field === 'session' || field === '_order') continue;
-      if (field === 'synthetic') {
-        // Cờ "dữ liệu cầu nhúng" chỉ dành cho phiên chưa có bản ghi thật.
-        if (!old) merged.synthetic = value;
-        else if (incomingQuality > 0) delete merged.synthetic;
-        continue;
-      }
-      if (field === 'side') {
-        // Kết quả có bằng chứng mạnh hơn không bị ghi đè bởi cầu nhúng/nhãn yếu hơn.
-        if (acceptOutcome && row.sideSource !== 'missing') merged.side = value;
-        continue;
-      }
-      if (field === 'dataWarning') {
-        if (acceptOutcome && row.sideSource && row.sideSource !== 'missing' && row.sideSource !== 'embedded_cau') {
-          merged.dataWarning = value || null;
-        }
-        continue;
-      }
-      if (field === 'sideSource' && !acceptOutcome) continue;
-      if (value === null || value === undefined || value === '') {
-        if (old && old[field] !== undefined && old[field] !== null && old[field] !== '') continue;
-      }
-      if (Array.isArray(value) && value.length === 0 && old && Array.isArray(old[field]) && old[field].length) continue;
-      merged[field] = value;
-    }
-    if (old && old._order) merged._order = old._order;
-    else merged._order = ++order;
-    map.set(key, merged);
-  }
-
-  let mergedRows = Array.from(map.values()).sort(compareSourceRows);
-  if (mergedRows.length > SOURCE_LIMIT) mergedRows = mergedRows.slice(-SOURCE_LIMIT);
-  saveJSON(sourceFile(gameId), mergedRows);
-  return mergedRows.reverse(); // newest-first
-}
-
-/* =========================== PREDICTION ENGINE =========================== */
-function binarySide(side, type) {
-  if (type === 'xocdia') {
-    if (side === 'CHAN') return 'T';
-    if (side === 'LE') return 'X';
-    return null;
-  }
-  return side === 'T' || side === 'X' ? side : null;
-}
-
-function smoothedRate(values, base, prior = 8) {
-  if (!values.length) return base;
-  const countT = values.filter(v => v === 'T').length;
-  return (countT + base * prior) / (values.length + prior);
-}
-
-function currentRun(sides) {
-  if (!sides.length) return 0;
-  const last = sides[sides.length - 1];
-  let run = 1;
-  for (let i = sides.length - 2; i >= 0 && sides[i] === last; i--) run++;
-  return run;
-}
-
-function markovRate(sides, order, base, prior) {
-  if (sides.length <= order) return base;
-  const context = sides.slice(-order);
-  let count = 0;
-  let countT = 0;
-  for (let i = 0; i + order < sides.length; i++) {
-    let match = true;
-    for (let j = 0; j < order; j++) {
-      if (sides[i + j] !== context[j]) { match = false; break; }
-    }
-    if (match) {
-      count++;
-      if (sides[i + order] === 'T') countT++;
-    }
-  }
-  return (countT + base * prior) / (count + prior);
-}
-
-function patternRate(sides, base, profile) {
-  for (let order = Math.min(profile.patternMaxOrder, sides.length - 1); order >= 2; order--) {
-    const context = sides.slice(-order);
-    let count = 0;
-    let countT = 0;
-    for (let i = 0; i + order < sides.length; i++) {
-      let match = true;
-      for (let j = 0; j < order; j++) {
-        if (sides[i + j] !== context[j]) { match = false; break; }
-      }
-      if (match) {
-        count++;
-        if (sides[i + order] === 'T') countT++;
-      }
-    }
-    if (count >= profile.patternMinMatches) {
-      return (countT + base * profile.patternPrior) / (count + profile.patternPrior);
-    }
-  }
-  return base;
-}
-
-function runRate(sides, base, profile) {
-  if (!sides.length) return base;
-  const lastSide = sides[sides.length - 1];
-  const wanted = Math.min(7, currentRun(sides));
-  const runLengths = Array(sides.length).fill(1);
-  for (let i = 1; i < sides.length; i++) {
-    runLengths[i] = sides[i] === sides[i - 1] ? runLengths[i - 1] + 1 : 1;
-  }
-  let count = 0;
-  let countT = 0;
-  for (let i = 0; i < sides.length - 1; i++) {
-    // Chỉ so các chuỗi bệt cùng cửa với trạng thái hiện tại.
-    if (sides[i] === lastSide && Math.min(7, runLengths[i]) === wanted) {
-      count++;
-      if (sides[i + 1] === 'T') countT++;
-    }
-  }
-  return (countT + base * profile.runPrior) / (count + profile.runPrior);
-}
-
-function sumBand(sum) {
-  if (!Number.isFinite(Number(sum))) return null;
-  const n = Number(sum);
-  if (n <= 7) return 'low';
-  if (n <= 13) return 'mid';
-  return 'high';
-}
-
-function sumBandRate(rows, binaryRows, base, profile) {
-  const latest = rows[rows.length - 1];
-  const bucket = latest ? sumBand(latest.sum) : null;
-  if (!bucket) return base;
-  let count = 0;
-  let countT = 0;
-  for (let i = 0; i < rows.length - 1; i++) {
-    if (sumBand(rows[i].sum) !== bucket || !binaryRows[i + 1]) continue;
-    count++;
-    if (binaryRows[i + 1] === 'T') countT++;
-  }
-  return (countT + base * profile.sumBandPrior) / (count + profile.sumBandPrior);
-}
-
-function diceDistributionRate(rows) {
-  const recent = rows.slice(-120).filter(row => Array.isArray(row.dice) && row.dice.length === 3);
-  if (recent.length < 12) return null;
-  const counts = [0, 0, 0, 0, 0, 0];
-  let total = 0;
-  for (const row of recent) {
-    for (const face of row.dice) {
-      const n = Number(face);
-      if (n >= 1 && n <= 6) { counts[n - 1]++; total++; }
-    }
-  }
-  if (!total) return null;
-  // Prior 3 lần mỗi mặt giúp tránh phản ứng quá mạnh với mẫu nhỏ.
-  const probs = counts.map(c => (c + 3) / (total + 18));
-  let dist = [1];
-  for (let die = 0; die < 3; die++) {
-    const next = Array(19).fill(0);
-    for (let sum = 0; sum < dist.length; sum++) {
-      for (let face = 1; face <= 6; face++) next[sum + face] += dist[sum] * probs[face - 1];
-    }
-    dist = next;
-  }
-  let low = 0;
-  let high = 0;
-  for (let sum = 3; sum <= 18; sum++) {
-    if (sum >= 11) high += dist[sum] || 0;
-    else low += dist[sum] || 0;
-  }
-  return high + low > 0 ? high / (high + low) : null;
-}
-
-/**
- * Phân tích cấu trúc cầu nâng cao (bệt, đảo, cụm, chu kỳ, gãy, hỗn hợp).
- * Dùng cho lý do, điều chỉnh confidence nhẹ và regime-aware weighting (ưu tiên LC79).
- * Không thay đổi công thức cốt lõi của các component Markov/pattern/run hiện có.
- */
-function entropyOfSides(sides, window = 20) {
-  const seq = sides.slice(-window);
-  if (seq.length < 4) return 1;
-  const counts = { T: 0, X: 0 };
-  for (const s of seq) counts[s] = (counts[s] || 0) + 1;
-  const n = seq.length;
-  let h = 0;
-  for (const c of Object.values(counts)) {
-    if (c > 0) {
-      const p = c / n;
-      h -= p * Math.log2(p);
-    }
-  }
-  return h; // 0 = pure, 1 = balanced
-}
-
-function switchRate(sides, window = 20) {
-  const seq = sides.slice(-window);
-  if (seq.length < 2) return 0.5;
-  let switches = 0;
-  for (let i = 1; i < seq.length; i++) if (seq[i] !== seq[i - 1]) switches++;
-  return switches / (seq.length - 1);
-}
-
-function detectCycle(sides, maxPeriod = 6) {
-  const seq = sides.slice(-Math.min(40, sides.length));
-  if (seq.length < 8) return null;
-  let best = null;
-  for (let period = 2; period <= maxPeriod; period++) {
-    if (seq.length < period * 3) continue;
-    let matches = 0;
-    let total = 0;
-    for (let i = period; i < seq.length; i++) {
-      if (seq[i] === seq[i - period]) matches++;
-      total++;
-    }
-    const score = total > 0 ? matches / total : 0;
-    // Yêu cầu độ khớp cao và ít nhất 2 chu kỳ đầy đủ gần đây
-    if (score >= 0.72 && total >= period * 2) {
-      if (!best || score > best.score || (score === best.score && period < best.period)) {
-        best = { period, score, matches, total };
-      }
-    }
-  }
-  return best;
-}
-
-function detectDaoPattern(sides) {
-  const seq = sides.slice(-16);
-  if (seq.length < 6) return null;
-  // 1-1
-  let is11 = true;
-  for (let i = 1; i < seq.length; i++) {
-    if (seq[i] === seq[i - 1]) { is11 = false; break; }
-  }
-  if (is11) return { type: 'DAO_11', length: seq.length, stability: 1 };
-
-  // 2-2
-  let is22 = true;
-  for (let i = 0; i + 1 < seq.length; i += 2) {
-    if (seq[i] !== seq[i + 1]) { is22 = false; break; }
-    if (i + 2 < seq.length && seq[i + 2] === seq[i]) { is22 = false; break; }
-  }
-  if (is22 && seq.length >= 6) return { type: 'DAO_22', length: seq.length, stability: 0.9 };
-
-  // 3-3 rough
-  let is33 = true;
-  for (let i = 0; i + 2 < seq.length; i += 3) {
-    if (seq[i] !== seq[i + 1] || seq[i] !== seq[i + 2]) { is33 = false; break; }
-    if (i + 3 < seq.length && seq[i + 3] === seq[i]) { is33 = false; break; }
-  }
-  if (is33 && seq.length >= 9) return { type: 'DAO_33', length: seq.length, stability: 0.85 };
-
-  return null;
-}
-
-function detectCumPattern(sides) {
-  // Các mẫu cụm phổ biến: 2-1, 1-2, 3-1, 1-3, 2-1-2, 1-2-1
-  const seq = sides.slice(-12);
-  if (seq.length < 5) return null;
-  const str = seq.join('');
-  const patterns = [
-    { re: /(TTX){2,}/, name: '2-1' },
-    { re: /(XXT){2,}/, name: '2-1' },
-    { re: /(TXX){2,}/, name: '1-2' },
-    { re: /(XTT){2,}/, name: '1-2' },
-    { re: /(TTTX){2,}/, name: '3-1' },
-    { re: /(XXXT){2,}/, name: '3-1' },
-    { re: /(TXXX){2,}/, name: '1-3' },
-    { re: /(XTTT){2,}/, name: '1-3' },
-    { re: /(TTXTTX)/, name: '2-1-2' },
-    { re: /(XXTXXT)/, name: '2-1-2' },
-    { re: /(TXTTXT)/, name: '1-2-1' },
-    { re: /(XTXXTX)/, name: '1-2-1' }
-  ];
-  for (const p of patterns) {
-    if (p.re.test(str)) return { type: 'CUM', name: p.name, match: str };
-  }
-  return null;
-}
-
-function analyzeCauStructure(sides) {
-  if (!sides || sides.length < 5) {
-    return {
-      regime: 'WEAK',
-      run: 0,
-      switchRate: 0.5,
-      entropy: 1,
-      cycle: null,
-      dao: null,
-      cum: null,
-      stability: 0,
-      description: 'Dữ liệu chưa đủ để nhận diện cầu'
-    };
-  }
-
-  const run = currentRun(sides);
-  const last = sides[sides.length - 1];
-  const sw = switchRate(sides, 20);
-  const ent = entropyOfSides(sides, 20);
-  const cycle = detectCycle(sides);
-  const dao = detectDaoPattern(sides);
-  const cum = detectCumPattern(sides);
-
-  let regime = 'MIXED';
-  let stability = 0.4;
-  let description = 'Cầu hỗn hợp / tín hiệu yếu';
-
-  if (run >= 5) {
-    regime = 'BET';
-    stability = Math.min(0.95, 0.55 + run * 0.06);
-    description = `Bệt ${run} phiên ${last === 'T' ? 'Tài' : 'Xỉu'}`;
-  } else if (run >= 3 && sw < 0.35) {
-    regime = 'BET';
-    stability = 0.6;
-    description = `Bệt ngắn ${run} phiên, xu hướng đang giữ`;
-  } else if (dao) {
-    regime = dao.type;
-    stability = dao.stability;
-    description = `Đảo ${dao.type.replace('DAO_', '')} ổn định (~${dao.length} phiên)`;
-  } else if (cycle && cycle.score >= 0.78) {
-    regime = 'CYCLE';
-    stability = cycle.score;
-    description = `Chu kỳ ${cycle.period} (khớp ${(cycle.score * 100).toFixed(0)}%)`;
-  } else if (cum) {
-    regime = 'CUM';
-    stability = 0.65;
-    description = `Cầu cụm dạng ${cum.name}`;
-  } else if (sw > 0.65 && ent > 0.9) {
-    regime = 'MIXED';
-    stability = 0.25;
-    description = 'Cầu hỗn hợp, tần suất đổi cửa cao';
-  } else if (sw < 0.4) {
-    regime = 'BET';
-    stability = 0.5;
-    description = 'Xu hướng bệt nhẹ / ít đảo';
-  }
-
-  // Phát hiện gãy: nếu trước đó có bệt dài hoặc đảo rõ nhưng gần đây bị phá
-  const recent = sides.slice(-8);
-  const older = sides.slice(-16, -8);
-  if (older.length >= 6) {
-    const oldRun = currentRun(older);
-    const oldSw = switchRate(older, 8);
-    if ((oldRun >= 4 || oldSw < 0.25) && sw > 0.55 && run <= 2) {
-      regime = 'GAY';
-      stability = 0.35;
-      description = 'Cầu gãy: cấu trúc cũ bị phá, đang chuyển trạng thái';
-    }
-  }
-
-  return {
-    regime,
-    run,
-    last,
-    switchRate: Math.round(sw * 1000) / 1000,
-    entropy: Math.round(ent * 1000) / 1000,
-    cycle,
-    dao,
-    cum,
-    stability: Math.round(stability * 1000) / 1000,
-    description
-  };
-}
-
-
-const DEFAULT_MODEL_WEIGHTS = {
-  base: 0.15, short: 0.11, medium: 0.10, long: 0.08, ewma: 0.10,
-  markov1: 0.11, markov2: 0.10, markov3: 0.07,
-  pattern: 0.08, run: 0.06, sumBand: 0.02, dice: 0.02
-};
-
-// Every endpoint has its own profile and learns only from that game's source file.
-// The profiles start with different time horizons; walk-forward scores then adjust
-// component weights independently for each game.
-const MODEL_PROFILES = {
-  'lc79/tx': makeModelProfile('lc79-tx-adaptive', {
-    shortWindow: 10, mediumWindow: 30, longWindow: 72, ewmaAlpha: 0.13,
-    markovPriors: [7, 11, 15], patternMaxOrder: 6, patternMinMatches: 2,
-    patternPrior: 6, runPrior: 7, sumBandPrior: 10, evalWindow: 64,
-    weights: { short: 0.15, medium: 0.09, long: 0.05, ewma: 0.11, markov1: 0.11, markov2: 0.11, markov3: 0.08, pattern: 0.12, run: 0.08, sumBand: 0.03, dice: 0.06 }
-  }),
-  'lc79/md5': makeModelProfile('lc79-md5-adaptive', {
-    shortWindow: 12, mediumWindow: 34, longWindow: 78, ewmaAlpha: 0.11,
-    markovPriors: [8, 12, 16], patternMaxOrder: 6, patternMinMatches: 2,
-    patternPrior: 7, runPrior: 7, sumBandPrior: 10, evalWindow: 64,
-    weights: { short: 0.13, medium: 0.10, long: 0.06, ewma: 0.10, markov1: 0.11, markov2: 0.11, markov3: 0.09, pattern: 0.11, run: 0.08, sumBand: 0.03, dice: 0.07 }
-  }),
-  'lc79/xocdia': makeModelProfile('lc79-xocdia-parity', {
-    shortWindow: 16, mediumWindow: 42, longWindow: 96, ewmaAlpha: 0.09,
-    markovPriors: [9, 13, 17], patternMaxOrder: 5, patternMinMatches: 3,
-    patternPrior: 8, runPrior: 9, sumBandPrior: 12, evalWindow: 60,
-    weights: { short: 0.10, medium: 0.11, long: 0.09, ewma: 0.10, markov1: 0.12, markov2: 0.11, markov3: 0.06, pattern: 0.08, run: 0.08 }
-  }),
-  'betvip/tx': makeModelProfile('betvip-tx-balanced', {
-    shortWindow: 14, mediumWindow: 40, longWindow: 90, ewmaAlpha: 0.10,
-    markovPriors: [8, 13, 17], patternMaxOrder: 5, patternMinMatches: 3,
-    patternPrior: 8, runPrior: 9, sumBandPrior: 11, evalWindow: 58,
-    weights: { short: 0.12, medium: 0.12, long: 0.08, ewma: 0.11, markov1: 0.12, markov2: 0.10, markov3: 0.06, pattern: 0.09, run: 0.07, sumBand: 0.03, dice: 0.05 }
-  }),
-  'betvip/md5': makeModelProfile('betvip-md5-context', {
-    shortWindow: 12, mediumWindow: 36, longWindow: 84, ewmaAlpha: 0.11,
-    markovPriors: [8, 12, 16], patternMaxOrder: 6, patternMinMatches: 2,
-    patternPrior: 7, runPrior: 8, sumBandPrior: 10, evalWindow: 60,
-    weights: { short: 0.12, medium: 0.10, long: 0.07, ewma: 0.11, markov1: 0.11, markov2: 0.11, markov3: 0.08, pattern: 0.10, run: 0.07, sumBand: 0.03, dice: 0.06 }
-  }),
-  'max789/tx': makeModelProfile('max789-tx-longer-context', {
-    shortWindow: 18, mediumWindow: 48, longWindow: 112, ewmaAlpha: 0.075,
-    markovPriors: [10, 15, 20], patternMaxOrder: 5, patternMinMatches: 3,
-    patternPrior: 9, runPrior: 10, sumBandPrior: 12, evalWindow: 64,
-    weights: { short: 0.08, medium: 0.12, long: 0.11, ewma: 0.08, markov1: 0.13, markov2: 0.11, markov3: 0.06, pattern: 0.08, run: 0.07, sumBand: 0.03, dice: 0.08 }
-  }),
-  'max789/md5': makeModelProfile('max789-md5-longer-context', {
-    shortWindow: 16, mediumWindow: 46, longWindow: 108, ewmaAlpha: 0.08,
-    markovPriors: [9, 14, 19], patternMaxOrder: 5, patternMinMatches: 3,
-    patternPrior: 9, runPrior: 10, sumBandPrior: 12, evalWindow: 64,
-    weights: { short: 0.09, medium: 0.12, long: 0.10, ewma: 0.09, markov1: 0.12, markov2: 0.11, markov3: 0.07, pattern: 0.09, run: 0.07, sumBand: 0.03, dice: 0.08 }
-  }),
-  'max789/kubet': makeModelProfile('max789-kubet-context', {
-    shortWindow: 14, mediumWindow: 42, longWindow: 96, ewmaAlpha: 0.09,
-    markovPriors: [8, 13, 18], patternMaxOrder: 5, patternMinMatches: 3,
-    patternPrior: 8, runPrior: 9, sumBandPrior: 11, evalWindow: 60,
-    weights: { short: 0.10, medium: 0.12, long: 0.09, ewma: 0.10, markov1: 0.12, markov2: 0.11, markov3: 0.07, pattern: 0.09, run: 0.07, sumBand: 0.03, dice: 0.08 }
-  }),
-  'hitclub/tx': makeModelProfile('hitclub-tx-recent-context', {
-    shortWindow: 12, mediumWindow: 36, longWindow: 88, ewmaAlpha: 0.11,
-    markovPriors: [8, 12, 17], patternMaxOrder: 6, patternMinMatches: 2,
-    patternPrior: 7, runPrior: 8, sumBandPrior: 10, evalWindow: 58,
-    weights: { short: 0.13, medium: 0.11, long: 0.07, ewma: 0.11, markov1: 0.12, markov2: 0.10, markov3: 0.07, pattern: 0.10, run: 0.07, sumBand: 0.03, dice: 0.06 }
-  }),
-  'hitclub/md5': makeModelProfile('hitclub-md5-pattern-context', {
-    shortWindow: 10, mediumWindow: 34, longWindow: 80, ewmaAlpha: 0.12,
-    markovPriors: [7, 12, 16], patternMaxOrder: 6, patternMinMatches: 2,
-    patternPrior: 7, runPrior: 8, sumBandPrior: 10, evalWindow: 58,
-    weights: { short: 0.14, medium: 0.10, long: 0.06, ewma: 0.12, markov1: 0.11, markov2: 0.10, markov3: 0.08, pattern: 0.11, run: 0.07, sumBand: 0.03, dice: 0.06 }
-  })
-};
-
-function getModelProfile(gameId) {
-  return MODEL_PROFILES[gameId] || makeModelProfile('default-balanced', { weights: DEFAULT_MODEL_WEIGHTS });
-}
-
-function getComponents(history, type, profile) {
-  const usableRows = history.filter(row => binarySide(row.side, type));
-  const sides = usableRows.map(row => binarySide(row.side, type));
-  const n = sides.length;
-  if (n < 5) return null;
-
-  const tCount = sides.filter(side => side === 'T').length;
-  const base = (tCount + 5) / (n + 10);
-  const components = {
-    base,
-    short: smoothedRate(sides.slice(-profile.shortWindow), base, 6),
-    medium: smoothedRate(sides.slice(-profile.mediumWindow), base, 10),
-    long: smoothedRate(sides.slice(-profile.longWindow), base, 16),
-    markov1: markovRate(sides, 1, base, profile.markovPriors[0]),
-    markov2: markovRate(sides, 2, base, profile.markovPriors[1]),
-    markov3: markovRate(sides, 3, base, profile.markovPriors[2]),
-    pattern: patternRate(sides, base, profile),
-    run: runRate(sides, base, profile),
-    sumBand: sumBandRate(usableRows, sides, base, profile)
-  };
-
-  let ewma = base;
-  for (const side of sides.slice(-profile.longWindow)) {
-    ewma = (1 - profile.ewmaAlpha) * ewma + profile.ewmaAlpha * (side === 'T' ? 1 : 0);
-  }
-  const ewmaReliability = Math.min(1, n / 35);
-  components.ewma = base * (1 - ewmaReliability) + ewma * ewmaReliability;
-
-  if (type !== 'xocdia') {
-    const diceRate = diceDistributionRate(usableRows);
-    if (diceRate !== null) {
-      // Giảm ảnh hưởng mô hình xúc xắc khi chưa đủ nhiều phiên.
-      const diceReliability = Math.min(profile.diceMaxReliability, Math.max(0, (n - 10) / 180));
-      components.dice = base * (1 - diceReliability) + diceRate * diceReliability;
-    }
-  }
-  return { components, sides, n, run: currentRun(sides), last: sides[n - 1], usableRows };
-}
-
-function modelProbability(history, type, gameId = 'default') {
-  const profile = getModelProfile(gameId);
-  const current = getComponents(history, type, profile);
-  if (!current) return null;
-  const { components, sides, n, run, last, usableRows } = current;
-  const adaptive = {};
-
-  // Tự chấm từng mô hình trên các phiên đã xảy ra (walk-forward), không dùng
-  // kết quả tương lai của phiên đang dự đoán. Độ tin cậy được co về 50% để
-  // tránh một đoạn cầu ngắn làm thay đổi trọng số quá mạnh.
-  const start = Math.max(profile.backtestMin, n - profile.evalWindow);
-  const wins = {};
-  const trials = {};
-  for (let i = start; i < n; i++) {
-    const pastRows = usableRows.slice(0, i);
-    const sample = getComponents(pastRows, type, profile);
-    if (!sample) continue;
-    const actual = sides[i];
-    for (const [key, probability] of Object.entries(sample.components)) {
-      if (!Number.isFinite(probability)) continue;
-      trials[key] = (trials[key] || 0) + 1;
-      if ((probability >= 0.5 ? 'T' : 'X') === actual) wins[key] = (wins[key] || 0) + 1;
-    }
-  }
-
-  let weighted = 0;
-  let totalWeight = 0;
-  const componentRows = [];
-  for (const [key, probability] of Object.entries(components)) {
-    if (!Number.isFinite(probability)) continue;
-    const count = trials[key] || 0;
-    const hit = wins[key] || 0;
-    const accuracy = (hit + 5) / (count + 10); // prior tương đương 10 lần thử, 5 lần đúng
-    const factor = count >= 8 ? Math.max(0.72, Math.min(1.28, accuracy / 0.5)) : 1;
-    const weight = (profile.weights[key] || DEFAULT_MODEL_WEIGHTS[key] || 0.04) * factor;
-    weighted += probability * weight;
-    totalWeight += weight;
-    componentRows.push({ key, p: probability, weight, accuracy: count ? accuracy : null, trials: count });
-    adaptive[key] = count ? Math.round(accuracy * 100) : null;
-  }
-
-  let pT = totalWeight ? weighted / totalWeight : components.base;
-  // Biên an toàn: không hiển thị độ tin cậy ảo kiểu 90–100% trên chuỗi ngẫu nhiên.
-  pT = Math.max(0.37, Math.min(0.63, pT));
-  let side = pT >= 0.5 ? 'T' : 'X';
-  let confidence = Math.max(50, Math.min(63, Math.round(Math.max(pT, 1 - pT) * 100)));
-
-  // Phân tích cấu trúc cầu nâng cao (dùng cho lý do + điều chỉnh nhẹ confidence).
-  // Chỉ điều chỉnh mạnh hơn cho LC79; MAX789 giữ hành vi gần như nguyên bản.
-  const cauInfo = analyzeCauStructure(sides);
-  const isLc79 = gameId.startsWith('lc79/');
-  const isMax789 = gameId.startsWith('max789/');
-
-  if (!isMax789 && cauInfo.regime === 'GAY') {
-    // Khi cầu vừa gãy, giảm confidence để tránh tín hiệu nhiễu.
-    confidence = Math.max(50, confidence - 3);
-  } else if (isLc79 && (cauInfo.regime === 'BET' || cauInfo.regime.startsWith('DAO_') || cauInfo.regime === 'CYCLE') && cauInfo.stability >= 0.7) {
-    // Cầu rõ và ổn định trên LC79: tăng nhẹ confidence nếu các component đồng thuận.
-    const agree = componentRows.filter(r => r.key !== 'base' && ((r.p >= 0.5 ? 'T' : 'X') === side)).length;
-    if (agree >= 4) confidence = Math.min(63, confidence + 2);
-  } else if (cauInfo.regime === 'MIXED' && cauInfo.switchRate > 0.6) {
-    confidence = Math.max(50, confidence - 2);
-  }
-
-  const strongest = componentRows
-    .filter(row => row.key !== 'base')
-    .sort((a, b) => Math.abs(b.p - 0.5) - Math.abs(a.p - 0.5))
-    .slice(0, 2);
-  // Nội bộ mô hình dùng T/X. Với Xóc Đĩa T tương ứng Chẵn và X tương ứng Lẻ,
-  // nên nhãn lý do phải được đổi theo loại game, không dùng chung Tài/Xỉu.
-  const sideWord = value => type === 'xocdia'
-    ? (value === 'T' ? 'Chẵn' : 'Lẻ')
-    : (value === 'T' ? 'Tài' : 'Xỉu');
-  const reasons = [];
-  // Ưu tiên mô tả cấu trúc cầu thực tế
-  if (cauInfo.regime === 'BET' && run >= 3) {
-    reasons.push(`Đang bệt ${run} phiên ${sideWord(last)}; mô hình không mặc định đảo cầu`);
-  } else if (cauInfo.regime.startsWith('DAO_')) {
-    reasons.push(cauInfo.description);
-  } else if (cauInfo.regime === 'CYCLE' && cauInfo.cycle) {
-    reasons.push(`Chu kỳ ${cauInfo.cycle.period} khớp ${(cauInfo.cycle.score * 100).toFixed(0)}%`);
-  } else if (cauInfo.regime === 'CUM') {
-    reasons.push(cauInfo.description);
-  } else if (cauInfo.regime === 'GAY') {
-    reasons.push('Cầu gãy — cấu trúc cũ bị phá, tín hiệu đang chuyển');
-  }
-  if (strongest.length && Math.abs(strongest[0].p - 0.5) >= 0.035) {
-    const label = strongest[0].key === 'markov1' || strongest[0].key === 'markov2' || strongest[0].key === 'markov3'
-      ? 'chuyển tiếp chuỗi' : strongest[0].key === 'dice' ? 'phân bố mặt xúc xắc' :
-        strongest[0].key === 'pattern' ? 'mẫu chuỗi tương tự' :
-          strongest[0].key === 'run' ? 'thống kê độ dài bệt' : 'cửa sổ lịch sử';
-    reasons.push(`${label} nghiêng ${sideWord(strongest[0].p >= 0.5 ? 'T' : 'X')}`);
-  }
-  if (confidence <= 53 || cauInfo.regime === 'MIXED' || cauInfo.regime === 'WEAK') {
-    reasons.push('Tín hiệu yếu hoặc cầu hỗn hợp, xác suất hai cửa gần cân bằng');
-  }
-  if (!reasons.length) reasons.push('Tổng hợp tần suất, chuỗi chuyển tiếp và kiểm định lịch sử');
-
-  return {
-    side, confidence, pT, n, run, profile: profile.name,
-    lyDo: reasons.slice(0, 3).join(' · '),
-    cau: sides.slice(-20).map(s => s === 'T' ? 'T' : 'X').join(''),
-    adaptive,
-    components: componentRows,
-    regime: cauInfo.regime,
-    cauStructure: {
-      regime: cauInfo.regime,
-      run: cauInfo.run,
-      switchRate: cauInfo.switchRate,
-      entropy: cauInfo.entropy,
-      stability: cauInfo.stability,
-      description: cauInfo.description,
-      cycle: cauInfo.cycle ? { period: cauInfo.cycle.period, score: cauInfo.cycle.score } : null
-    }
-  };
-}
-
-function xocdiaPatternRanking(history, side) {
-  const allowed = side === 'CHAN' ? [0, 2, 4] : [1, 3];
-  // Phân phối nhị thức 4 mặt đồng xác suất, có điều kiện theo Chẵn/Lẻ.
-  const prior = side === 'CHAN'
-    ? { 0: 0.125, 2: 0.75, 4: 0.125 }
-    : { 1: 0.5, 3: 0.5 };
-  const observed = {};
-  let samples = 0;
-  for (const row of history.slice(-160)) {
-    let count = Number.isInteger(row.doCount) ? row.doCount : redCountFromVi(row.vi);
-    if (count === null || !allowed.includes(count)) continue;
-    observed[count] = (observed[count] || 0) + 1;
-    samples++;
-  }
-  const priorStrength = 12;
-  const total = samples + priorStrength;
-  return allowed.map(count => ({
-    count,
-    vi: formatXocdia(count),
-    probability: ((observed[count] || 0) + priorStrength * prior[count]) / total,
-    observed: observed[count] || 0
-  })).sort((a, b) => b.probability - a.probability);
-}
-
-
-class Engine {
-  constructor(gameId, type) {
-    this.id = gameId;
-    this.type = type;
-    this.history = [];
-  }
-
-  loadHistory(newestFirstRows) {
-    const chronological = [...newestFirstRows].reverse();
-    const bySession = new Map();
-    for (const row of chronological) {
-      if (!row || !row.side) continue;
-      bySession.set(String(row.session), {
-        session: row.session, side: row.side, sum: toNumber(row.sum),
-        dice: Array.isArray(row.dice) ? row.dice : [], vi: row.vi || null,
-        doCount: Number.isInteger(row.doCount) ? row.doCount : redCountFromVi(row.vi),
-        trangCount: Number.isInteger(row.trangCount) ? row.trangCount : null,
-        time: row.time || null,
-        synthetic: row.synthetic === true || row.sideSource === 'embedded_cau'
-      });
-    }
-
-    const latest = chronological[chronological.length - 1];
-    const embedded = latest && typeof latest.cau === 'string'
-      ? latest.cau.toUpperCase().replace(/[^TX]/g, '') : '';
-    if (embedded.length >= 5 && isNumericSession(latest.session) && (latest.side === 'T' || latest.side === 'X')) {
-      let sequence = embedded;
-      if (sequence[0] === latest.side && sequence[sequence.length - 1] !== latest.side) sequence = sequence.split('').reverse().join('');
-      if (sequence[sequence.length - 1] === latest.side) {
-        try {
-          const end = BigInt(String(latest.session));
-          const first = end - BigInt(sequence.length - 1);
-          if (first >= 0n) {
-            for (let i = 0; i < sequence.length; i++) {
-              const session = (first + BigInt(i)).toString();
-              if (!bySession.has(session)) bySession.set(session, {
-                session, side: sequence[i], sum: null, dice: [], vi: null,
-                doCount: null, trangCount: null, time: null, synthetic: true
-              });
-            }
-          }
-        } catch (_) { /* ignore malformed session sequence */ }
-      }
-    }
-
-    this.history = Array.from(bySession.values()).sort((a, b) => {
-      if (isNumericSession(a.session) && isNumericSession(b.session)) {
-        const aa = BigInt(String(a.session)), bb = BigInt(String(b.session));
-        return aa < bb ? -1 : aa > bb ? 1 : 0;
-      }
-      return String(a.session).localeCompare(String(b.session));
+const { test, after } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const Module = require('node:module');
+
+// Test parser/logic offline; external npm modules are stubbed because tests never
+// open an HTTP server or make live API calls.
+const originalLoad = Module._load;
+const registeredRoutes = new Map();
+const axiosState = { data: null };
+Module._load = function(request, parent, isMain) {
+  if (request === 'express') {
+    const express = () => ({
+      use() {}, set() {},
+      get(route, handler) { registeredRoutes.set(`GET ${route}`, handler); },
+      listen() { return { close() {} }; }
     });
-    if (this.history.length > SOURCE_LIMIT) this.history = this.history.slice(-SOURCE_LIMIT);
+    express.json = () => (_req, _res, next) => next && next();
+    return express;
   }
+  if (request === 'axios') return { create: () => ({ get: async () => {
+    if (axiosState.data == null) throw new Error('offline test stub');
+    return { data: axiosState.data };
+  } }) };
+  if (request === 'cors') return () => (_req, _res, next) => next && next();
+  return originalLoad.call(this, request, parent, isMain);
+};
 
-  validSampleCount() {
-    return this.history.filter(row => binarySide(row.side, this.type)).length;
-  }
+const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pred-api-v3-test-'));
+process.env.DATA_DIR = testDataDir;
+const api = require('./server');
+// Tests simulate successive source polls, so each one must bypass the short result cache.
+const poll = gameId => { delete api._state.recentOk[gameId]; return api.runPredict(gameId); };
 
-  isReady() {
-    return this.validSampleCount() >= MIN_HISTORY_SESSIONS;
-  }
-
-  currentCau(maxLen = 20) {
-    return this.history.slice(-maxLen).map(row => {
-      if (row.side === 'T') return 'T';
-      if (row.side === 'X') return 'X';
-      if (row.side === 'CHAN') return 'C';
-      if (row.side === 'LE') return 'L';
-      return '?';
-    }).join('');
-  }
-
-  predict() {
-    if (!this.isReady()) {
-      return {
-        ready: false,
-        sampleSize: this.validSampleCount(),
-        requiredSamples: MIN_HISTORY_SESSIONS,
-        lyDo: `Đang học dữ liệu: cần tối thiểu ${MIN_HISTORY_SESSIONS} phiên hợp lệ`
-      };
-    }
-    if (this.type === 'xocdia') {
-      const model = modelProbability(this.history, 'xocdia', this.id);
-      if (!model) {
-        return {
-          ready: false, sampleSize: this.validSampleCount(),
-          requiredSamples: MIN_HISTORY_SESSIONS,
-          lyDo: 'Chưa đủ dữ liệu lịch sử để chấm mô hình'
-        };
-      }
-      const side = model.side === 'T' ? 'CHAN' : 'LE';
-      const ranked = xocdiaPatternRanking(this.history, side);
-      return {
-        side, label: sideLabel(side), conf: model.confidence,
-        pSide: model.pT, vi: ranked[0].vi,
-        topVi: ranked.map(x => x.vi),
-        viDetails: ranked.map(x => ({ vi: x.vi, probability: Math.round(x.probability * 1000) / 10 })),
-        lyDo: model.lyDo, cau: this.currentCau(20), sampleSize: model.n,
-        adaptive: model.adaptive
-      };
-    }
-
-    const model = modelProbability(this.history, this.type, this.id);
-    if (!model) {
-      return {
-        ready: false, sampleSize: this.validSampleCount(),
-        requiredSamples: MIN_HISTORY_SESSIONS,
-        lyDo: 'Chưa đủ dữ liệu lịch sử để chấm mô hình'
-      };
-    }
-    return {
-      side: model.side,
-      label: sideLabel(model.side),
-      conf: model.confidence,
-      pSide: model.pT,
-      topSums: [],
-      lyDo: model.lyDo,
-      cau: this.currentCau(20),
-      sampleSize: model.n,
-      streak: model.run,
-      adaptive: model.adaptive
-    };
-  }
-}
-
-/* ================================ STATE ================================== */
-const engines = {};
-const predHistoryRaw = loadJSON('pred_history.json', {});
-const predHistory = predHistoryRaw && typeof predHistoryRaw === 'object' && !Array.isArray(predHistoryRaw)
-  ? predHistoryRaw : {};
-const lastStatus = {};
-const inFlight = new Map();
-// Lịch sử nguồn mới nhất (newest-first) của từng game, cập nhật sau mỗi lần tải thành công.
-const sourceCache = {};
-// Kết quả thành công gần nhất, dùng lại trong vài giây để nhiều request không gọi nguồn liên tục.
-const recentOk = {};
-const REQUEST_CACHE_MS = 4000;
-
-function getEngine(gameId) {
-  if (!engines[gameId]) {
-    const game = GAMES[gameId];
-    engines[gameId] = new Engine(gameId, game ? game.type : 'tx');
-  }
-  return engines[gameId];
-}
-
-function getPredictionSide(value) {
-  return parseKetQua(value);
-}
-
-function findSourceResult(rows, session) {
-  return rows.find(row => String(row.session) === String(session));
-}
-
-function actualDiceText(row, gameType) {
-  if (!row) return null;
-  if (gameType === 'xocdia') return row.vi || (Number.isInteger(row.doCount) ? formatXocdia(row.doCount) : null);
-  if (Array.isArray(row.dice) && row.dice.length) return row.dice.join(' - ');
-  return null;
-}
-
-function formatCauForApi(value, gameType) {
-  if (gameType !== 'xocdia' || value == null) return value;
-  return String(value).split('').map(char => char === 'C' ? 'Chẵn' : char === 'L' ? 'Lẻ' : null)
-    .filter(Boolean).join(' → ');
-}
-
-function settlePredictionLogs(gameId, rows) {
-  const logs = Array.isArray(predHistory[gameId]) ? predHistory[gameId] : [];
-  const game = GAMES[gameId];
-  let changed = false;
-  for (const log of logs) {
-    if (!log || log.phien == null) continue;
-    const actualRow = findSourceResult(rows, log.phien);
-    if (!actualRow) continue;
-
-    if (log.risk_pause === true) {
-      // Phiên bỏ qua để bảo vệ không phải lượt cược: chỉ ghi kết quả thật của
-      // nguồn để /history không bị thiếu phiên, không tính đúng/sai.
-      if (!actualRow.side && actualRow.sideSource !== 'triple') continue;
-      const next = {
-        actual: actualRow.sideSource === 'triple' ? 'Bộ ba' : sideLabel(actualRow.side),
-        actual_side: actualRow.side || null,
-        actual_dice: actualDiceText(actualRow, game.type),
-        actual_sum: actualRow.sum == null ? null : actualRow.sum,
-        actual_vi: game.type === 'xocdia' ? actualDiceText(actualRow, game.type) : null,
-        data_warning: actualRow.dataWarning || null
-      };
-      const rowChanged = Object.keys(next).some(key => log[key] !== next[key]);
-      if (rowChanged) { changed = true; Object.assign(log, next); }
-      continue;
-    }
-
-    const predictedSide = log.pred_side || getPredictionSide(log.du_doan);
-
-    if (actualRow.sideSource === 'triple') {
-      const next = {
-        actual: 'Bộ ba', actual_side: null,
-        actual_dice: actualDiceText(actualRow, game.type),
-        actual_sum: actualRow.sum == null ? null : actualRow.sum,
-        actual_vi: game.type === 'xocdia' ? actualDiceText(actualRow, game.type) : null,
-        ok: null, void: true, data_warning: actualRow.dataWarning || null
-      };
-      const rowChanged = Object.keys(next).some(key => log[key] !== next[key]);
-      if (rowChanged) changed = true;
-      Object.assign(log, next);
-      if (rowChanged || !log.result_time) log.result_time = nowVN();
-      continue;
-    }
-    if (!actualRow.side || !predictedSide) continue;
-
-    const next = {
-      actual: sideLabel(actualRow.side), actual_side: actualRow.side,
-      actual_dice: actualDiceText(actualRow, game.type),
-      actual_sum: actualRow.sum == null ? null : actualRow.sum,
-      actual_vi: game.type === 'xocdia' ? actualDiceText(actualRow, game.type) : null,
-      ok: predictedSide === actualRow.side, void: false,
-      data_warning: actualRow.dataWarning || null
-    };
-    const rowChanged = Object.keys(next).some(key => log[key] !== next[key]);
-    if (rowChanged) changed = true;
-    const wasSettled = log.ok === true || log.ok === false;
-    Object.assign(log, next);
-    if (!wasSettled || rowChanged || log.result_time == null) log.result_time = nowVN();
-  }
-  if (changed) saveJSON('pred_history.json', predHistory);
-  return changed;
-}
-
-function pushPredLog(gameId, entry) {
-  if (!Array.isArray(predHistory[gameId])) predHistory[gameId] = [];
-  const logs = predHistory[gameId];
-  const phien = String(entry.phien);
-  const exists = logs.findIndex(row => String(row.phien) === phien);
-  if (exists >= 0) {
-    // Một phiên chỉ có một dự đoán: không ghi đè dự đoán đang chờ bằng dự đoán mới.
-    return logs[exists];
-  }
-  logs.unshift(entry);
-  if (logs.length > PRED_LIMIT) logs.length = PRED_LIMIT;
-  saveJSON('pred_history.json', predHistory);
-  return entry;
-}
-
-function consecutiveLossState(gameId, ignorePendingSession = null) {
-  const logs = Array.isArray(predHistory[gameId]) ? predHistory[gameId] : [];
-  let count = 0;
-  let lastLossSession = null;
-  for (const entry of logs) {
-    if (!entry) continue;
-    if (ignorePendingSession != null && String(entry.phien) === String(ignorePendingSession) &&
-        entry.risk_pause !== true && entry.ok == null) continue;
-    // A skipped forecast creates a deliberate gap and breaks the active loss run.
-    if (entry.risk_pause === true) return { count: 0, lastLossSession: null, protectedGap: true };
-    if (entry.void === true) continue;
-    if (entry.ok === false) {
-      count++;
-      if (count === 1) lastLossSession = String(entry.phien);
-      continue;
-    }
-    // A win or an unsettled result ends the consecutive settled-loss sequence.
-    break;
-  }
-  return { count, lastLossSession: count ? lastLossSession : null, protectedGap: false };
-}
-
-function nextSessionOf(latest) {
-  if (!latest) return '—';
-  if (latest.nextSession !== undefined && latest.nextSession !== null && String(latest.nextSession) !== '') {
-    return String(latest.nextSession);
-  }
-  const session = String(latest.session == null ? '' : latest.session);
-  if (isNumericSession(session)) {
-    try { return (BigInt(session) + 1n).toString(); } catch (_) {}
-  }
-  return session ? `${session}+1` : '—';
-}
-
-function predictionFromLog(log, game) {
-  if (log && log.risk_pause === true) {
-    return {
-      paused: true,
-      side: null,
-      label: null,
-      conf: null,
-      lyDo: log.pause_reason || 'Tạm dừng bảo vệ sau chuỗi dự đoán sai',
-      cau: log.cau || '',
-      vi: null,
-      topVi: [],
-      topSums: []
-    };
-  }
-  return {
-    side: log.pred_side || getPredictionSide(log.du_doan) || 'T',
-    label: log.du_doan || 'Tài',
-    conf: Number(log.conf) || 50,
-    lyDo: log.ly_do || 'Dự đoán đã lưu cho phiên này',
-    cau: log.cau || '',
-    vi: log.vi || null,
-    topVi: Array.isArray(log.top_vi) ? log.top_vi : [],
-    topSums: Array.isArray(log.top_sums) ? log.top_sums : []
-  };
-}
-
-/* ======================= EMBEDDED SOURCE HISTORY ======================== */
-function expandEmbeddedCauRows(rows) {
-  if (!Array.isArray(rows) || !rows.length) return [];
-  const candidates = rows.filter(row => row && row.cau && isNumericSession(row.session) && (row.side === 'T' || row.side === 'X'));
-  if (!candidates.length) return [];
-  candidates.sort((a, b) => {
-    if (isNumericSession(a.session) && isNumericSession(b.session)) {
-      const aa = BigInt(String(a.session)), bb = BigInt(String(b.session));
-      return aa > bb ? -1 : aa < bb ? 1 : 0;
-    }
-    return 0;
-  });
-  const latest = candidates[0];
-  let sequence = String(latest.cau).toUpperCase().replace(/[^TX]/g, '');
-  if (sequence.length < 5) return [];
-  if (sequence[sequence.length - 1] !== latest.side && sequence[0] === latest.side) {
-    sequence = sequence.split('').reverse().join('');
-  }
-  // Chỉ import nếu một đầu chuỗi khớp kết quả đã kiểm chứng của phiên hiện tại.
-  if (sequence[sequence.length - 1] !== latest.side) return [];
-  try {
-    const end = BigInt(String(latest.session));
-    const first = end - BigInt(sequence.length - 1);
-    if (first < 0n) return [];
-    const expanded = [];
-    for (let i = 0; i < sequence.length - 1; i++) {
-      expanded.push({
-        session: (first + BigInt(i)).toString(), side: sequence[i],
-        sideSource: 'embedded_cau', synthetic: true,
-        dice: [], sum: null, time: null
-      });
-    }
-    return expanded;
-  } catch (_) {
-    return [];
-  }
-}
-
-/* ============================== FETCH / PREDICT ========================== */
-async function fetchGame(gameId) {
-  const game = GAMES[gameId];
-  if (!game) throw new Error('Game không tồn tại');
-  const response = await http.get(game.url);
-  const parser = PARSERS[game.parser];
-  if (!parser) throw new Error(`Parser ${game.parser} không tồn tại`);
-  const parsed = parser(response.data);
-  if (!Array.isArray(parsed) || !parsed.length) {
-    throw new Error('API nguồn không trả về phiên hợp lệ hoặc cấu trúc JSON đã thay đổi');
-  }
-  const embeddedRows = expandEmbeddedCauRows(parsed);
-  const rows = mergeSourceHistory(gameId, [...parsed, ...embeddedRows]);
-  if (!rows.length) throw new Error('Không có lịch sử phiên sau khi chuẩn hóa');
-  sourceCache[gameId] = rows;
-  return { game, rows };
-}
-
-async function runPredictInternal(gameId) {
-  const { game, rows } = await fetchGame(gameId);
-  const engine = getEngine(gameId);
-  engine.loadHistory(rows);
-  settlePredictionLogs(gameId, rows);
-
-  const latest = rows[0] || {};
-  const nextSession = nextSessionOf(latest);
-  if (nextSession === '—') throw new Error('Không xác định được phiên tiếp theo');
-
-  const sampleCount = engine.validSampleCount();
-  const basePayload = {
-    id: IDOL,
-    Name: game.label,
-    Phien: latest.session != null
-      ? (isNumericSession(latest.session) ? Number(latest.session) : latest.session)
-      : null,
-    Ket_qua: game.type === 'xocdia'
-      ? (latest.vi || sideLabel(latest.side))
-      : (latest.side ? sideLabel(latest.side) : (latest.sideSource === 'triple' ? 'Bộ ba' : null)),
-    Cau_hien_tai: formatCauForApi(engine.currentCau(20), game.type),
-    Phien_tiep: isNumericSession(nextSession) ? Number(nextSession) : nextSession,
-    Time: nowVN(),
-    Data_warning: latest.dataWarning || null,
-    API_sample_size: latest.apiSampleSize || null,
-    Sample_size: sampleCount,
-    So_phien_toi_thieu: MIN_HISTORY_SESSIONS
-  };
-  if (game.type !== 'xocdia') {
-    basePayload.Xuc_xac = actualDiceText(latest, game.type);
-    basePayload.Tong = latest.sum == null ? null : latest.sum;
-  } else {
-    // Xóc Đĩa có bốn quân đỏ/trắng, không có xúc xắc hoặc tổng điểm.
-    basePayload.Chan_le = sideLabel(latest.side);
-    basePayload.Vi = latest.vi || null;
-  }
-
-  // Warm-up applies independently to every game. Existing persisted source
-  // sessions are reused; APIs that return only the current round accumulate
-  // distinct sessions through polling until five valid outcomes exist.
-  if (sampleCount < MIN_HISTORY_SESSIONS) {
-    const remaining = MIN_HISTORY_SESSIONS - sampleCount;
-    lastStatus[gameId] = {
-      ok: null, mode: 'learning', samples: sampleCount,
-      required: MIN_HISTORY_SESSIONS, error: null, time: nowVN()
-    };
-    return {
-      ...basePayload,
-      Trang_thai: 'DANG_HOC_DU_LIEU',
-      Is_ready: false,
-      Con_thieu: remaining,
-      Du_doan: null,
-      Du_doan_side: null,
-      do_tin_cay: null,
-      Ly_do: `Đang thu thập dữ liệu riêng cho ${game.label}: đã có ${sampleCount}/${MIN_HISTORY_SESSIONS} phiên hợp lệ; chưa phát dự đoán`,
-      Model_profile: getModelProfile(gameId).name
-    };
-  }
-
-  // One forecast (or one deliberate skip) per target session.
-  const existingLogs = Array.isArray(predHistory[gameId]) ? predHistory[gameId] : [];
-  let log = existingLogs.find(item => String(item.phien) === String(nextSession));
-  let pred;
-
-  if (log) {
-    pred = predictionFromLog(log, game);
-  } else {
-    const lossState = consecutiveLossState(gameId);
-    if (lossState.count >= 3) {
-      const reason = `Tạm dừng 1 phiên để hiệu chỉnh sau ${lossState.count} dự đoán sai liên tiếp; không tiếp tục đuổi cầu`;
-      log = pushPredLog(gameId, {
-        phien: nextSession,
-        du_doan: 'Tạm dừng bảo vệ',
-        pred_side: null,
-        conf: null,
-        ly_do: reason,
-        pause_reason: reason,
-        cau: engine.currentCau(20),
-        actual: null,
-        actual_side: null,
-        actual_dice: null,
-        ok: null,
-        void: false,
-        risk_pause: true,
-        loss_streak_before_pause: lossState.count,
-        time: nowVN()
-      });
-      pred = predictionFromLog(log, game);
-    } else {
-      pred = engine.predict();
-      if (!pred || pred.ready === false) {
-        throw new Error('Dữ liệu chưa đủ để khởi tạo mô hình dự đoán');
-      }
-      log = pushPredLog(gameId, {
-        phien: nextSession,
-        du_doan: pred.label,
-        pred_side: pred.side,
-        conf: pred.conf,
-        ly_do: pred.lyDo || null,
-        cau: pred.cau || null,
-        vi: pred.vi || null,
-        top_vi: pred.topVi || [],
-        top_sums: pred.topSums || [],
-        model_profile: pred.profile || getModelProfile(gameId).name,
-        training_sample_size: pred.sampleSize || sampleCount,
-        actual: null,
-        actual_side: null,
-        actual_dice: null,
-        ok: null,
-        time: nowVN()
-      });
-    }
-  }
-
-  const payload = {
-    ...basePayload,
-    Cau_hien_tai: formatCauForApi(pred.cau || engine.currentCau(20), game.type),
-    Du_doan: pred.paused ? null : pred.label,
-    Du_doan_side: pred.paused ? null : (game.type === 'xocdia' ? sideLabel(pred.side) : pred.side),
-    do_tin_cay: pred.paused ? null : pred.conf,
-    Ly_do: pred.lyDo || 'Tổng hợp thống kê lịch sử riêng của game',
-    Sample_size: pred.sampleSize || sampleCount,
-    Model_profile: log.model_profile || getModelProfile(gameId).name,
-    Consecutive_losses: pred.paused ? (log.loss_streak_before_pause || 3) : consecutiveLossState(gameId, nextSession).count,
-    Trang_thai: pred.paused ? 'TAM_DUNG_BAO_VE' : 'DA_SAN_SANG',
-    Is_ready: true,
-    Con_thieu: 0
-  };
-
-  if (game.type === 'xocdia') {
-    payload.Vi = pred.paused ? null : (pred.vi || null);
-    payload.Top_vi = pred.paused ? [] : (pred.topVi || []);
-    payload.Top_vi_chi_tiet = pred.paused ? [] : (pred.viDetails || []).map(item => ({ vi: item.vi, ti_le: item.probability }));
-    payload.Du_doan_vi = pred.paused ? null : (pred.vi || null);
-  }
-
-  lastStatus[gameId] = {
-    ok: true,
-    mode: pred.paused ? 'protected' : 'online',
-    samples: sampleCount,
-    required: MIN_HISTORY_SESSIONS,
-    error: null,
-    time: nowVN()
-  };
-  return payload;
-}
-
-function runPredict(gameId) {
-  if (inFlight.has(gameId)) return inFlight.get(gameId);
-  const cached = recentOk[gameId];
-  if (cached && Date.now() - cached.at < REQUEST_CACHE_MS) return Promise.resolve(cached.payload);
-  const task = runPredictInternal(gameId)
-    .then(payload => {
-      recentOk[gameId] = { at: Date.now(), payload };
-      return payload;
-    })
-    .catch(error => {
-      lastStatus[gameId] = { ok: false, error: error.message, time: nowVN() };
-      throw error;
-    })
-    .finally(() => inFlight.delete(gameId));
-  inFlight.set(gameId, task);
-  return task;
-}
-
-/* ============================== BACKGROUND =============================== */
-async function backgroundTick() {
-  const entries = Object.keys(GAMES);
-  const results = await Promise.allSettled(entries.map(gameId => runPredict(gameId)));
-  results.forEach((result, index) => {
-    if (result.status === 'rejected') {
-      console.error('[POLL]', entries[index], result.reason && result.reason.message);
-    }
-  });
-}
-
-let pollTimer = null;
-let firstPollTimer = null;
-function startPolling() {
-  if (pollTimer) return;
-  firstPollTimer = setTimeout(() => backgroundTick().catch(error => console.error('[POLL]', error.message)), 5000);
-  pollTimer = setInterval(() => backgroundTick().catch(error => console.error('[POLL]', error.message)), POLL_MS);
-  if (firstPollTimer.unref) firstPollTimer.unref();
-  if (pollTimer.unref) pollTimer.unref();
-}
-
-/* ================================= ROUTES ================================ */
-function getGamePredictionStats(gameId) {
-  const logs = Array.isArray(predHistory[gameId]) ? predHistory[gameId] : [];
-  const settled = logs.filter(row => row && row.risk_pause !== true && row.void !== true && (row.ok === true || row.ok === false));
-  const wins = settled.filter(row => row.ok === true).length;
-  const losses = settled.filter(row => row.ok === false).length;
-  const pending = logs.filter(row => row && row.risk_pause !== true && row.void !== true && row.ok == null).length;
-  const skipped = logs.filter(row => row && row.risk_pause === true).length;
-  const voided = logs.filter(row => row && row.void === true).length;
-  const decided = wins + losses;
-  const rate = decided ? Math.round((wins / decided) * 1000) / 10 : null;
-  return {
-    tong_phien: logs.length,
-    dung: wins,
-    sai: losses,
-    dang_cho: pending,
-    tam_dung: skipped,
-    bo_qua: voided,
-    ti_le_dung: rate,
-    ti_le: rate == null ? '—' : `${rate}%`
-  };
-}
-
-function buildOverview() {
-  const games = Object.entries(GAMES).map(([id, game]) => {
-    const status = lastStatus[id] || { ok: null, error: null, time: null };
-    return {
-      id: IDOL,
-      game: id,
-      name: game.label,
-      type: game.type,
-      status: status.ok === true
-        ? (status.mode === 'protected' ? 'protected' : 'online')
-        : status.ok === false ? 'error' : status.mode === 'learning' ? 'learning' : 'pending',
-      sample_size: status.samples || 0,
-      required_samples: status.required || MIN_HISTORY_SESSIONS,
-      error: status.error || null,
-      last_update: status.time,
-      thong_ke: getGamePredictionStats(id),
-      predict: `/${id}`,
-      history: `/${id}/history`
-    };
-  });
-  const totals = games.reduce((acc, game) => {
-    const t = game.thong_ke || {};
-    acc.tong += Number(t.tong_phien) || 0;
-    acc.dung += Number(t.dung) || 0;
-    acc.sai += Number(t.sai) || 0;
-    acc.dang_cho += Number(t.dang_cho) || 0;
-    return acc;
-  }, { tong: 0, dung: 0, sai: 0, dang_cho: 0 });
-  const decided = totals.dung + totals.sai;
-  totals.ti_le_dung = decided ? Math.round((totals.dung / decided) * 1000) / 10 : null;
-  return {
-    id: IDOL, name: 'PRED-API', version: '4.0.0', time: nowVN(),
-    total_games: games.length,
-    thong_ke_tong: totals,
-    online: games.filter(game => game.status === 'online').length,
-    learning: games.filter(game => game.status === 'learning' || game.status === 'pending').length,
-    protected: games.filter(game => game.status === 'protected').length,
-    offline: games.filter(game => game.status === 'error').length,
-    games
-  };
-}
-
-const DASHBOARD_HTML = `<!doctype html>
-<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PRED-API · Tổng quan</title>
-<style>
-:root{color-scheme:dark;--bg:#101419;--panel:#171e25;--line:#29333d;--muted:#91a0ad;--text:#e7edf2;--green:#5dc69a;--red:#e47d7d;--amber:#dfb66b;--blue:#8bb8e8}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-main{max-width:1120px;margin:0 auto;padding:24px 16px 40px}.top{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;margin-bottom:18px}.brand{font-size:21px;font-weight:700;letter-spacing:.2px}.sub,.muted{color:var(--muted);font-size:12px}.stamp{color:var(--muted);font-size:11px;text-align:right}
-.summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px;margin:16px 0 20px}.metric,.game{background:var(--panel);border:1px solid var(--line);border-radius:8px}.metric{padding:12px}.num{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums}.metric small{display:block;color:var(--muted);font-size:11px;margin-top:3px}
-.section{font-size:12px;color:var(--muted);font-weight:650;letter-spacing:.5px;text-transform:uppercase;margin:22px 0 10px}.games{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.game{padding:14px;min-width:0}.ghead{display:flex;justify-content:space-between;align-items:center;gap:8px}.gname{font-size:14px;font-weight:700}.status{font-size:11px;border:1px solid var(--line);border-radius:4px;padding:3px 7px;color:var(--muted);white-space:nowrap}.status.online{color:var(--green);border-color:#32634f}.status.learning,.status.pending{color:var(--amber);border-color:#655333}.status.error{color:var(--red);border-color:#693d3d}.status.protected{color:var(--blue);border-color:#3d5874}
-.progress{height:4px;background:#27313b;border-radius:5px;overflow:hidden;margin:11px 0 5px}.bar{height:100%;background:var(--blue)}.sample{font-size:11px;color:var(--muted)}.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-top:13px}.stat{border-top:1px solid var(--line);padding-top:8px}.stat b{display:block;font-size:16px;font-variant-numeric:tabular-nums}.stat span{color:var(--muted);font-size:10px}.wins{color:var(--green)}.losses{color:var(--red)}.rate{color:var(--blue)}.links{display:flex;gap:14px;margin-top:12px;font-size:11px}.links a{color:var(--blue);text-decoration:none}.links a:hover{text-decoration:underline}.error-text{color:var(--red);font-size:11px;margin-top:8px;overflow-wrap:anywhere}.footer{margin-top:18px;color:var(--muted);font-size:11px}
-@media(max-width:640px){main{padding:17px 11px 28px}.top{align-items:flex-start}.summary{grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.games{grid-template-columns:1fr}.metric{padding:10px}.num{font-size:20px}}
-</style></head><body><main>
-<header class="top"><div><div class="brand">PRED-API <span class="muted">/ v4.0</span></div><div class="sub">Tổng quan game · thống kê dự đoán · trạng thái dữ liệu</div></div><div class="stamp" id="updated">Đang tải…</div></header>
-<section class="summary" id="summary"><div class="metric"><div class="num">—</div><small>Đang tải dữ liệu</small></div></section>
-<div class="section">Danh sách game</div><section class="games" id="games"><div class="game muted">Đang tải danh sách game…</div></section>
-<div class="footer">Tỉ lệ đúng tính trên các phiên đã chốt trong lịch sử dự đoán đang lưu. Tối thiểu 5 phiên hợp lệ trước khi phát dự đoán.</div>
-</main><script>
-const $=id=>document.getElementById(id);const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const statusText={online:'Đang chạy',learning:'Đang học',pending:'Chờ dữ liệu',protected:'Tạm dừng bảo vệ',error:'Lỗi API'};
-async function load(){try{const r=await fetch('/overview',{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);const d=await r.json();
-$('updated').textContent='Cập nhật: '+(d.time||'—');
-const t=d.thong_ke_tong||{};const rateTxt=t.ti_le_dung==null?'—':t.ti_le_dung+'%';$('summary').innerHTML=[[d.total_games||0,'Tổng game'],[d.online||0,'Đang chạy'],[d.learning||0,'Đang học'],[d.offline||0,'Lỗi API'],[t.tong||0,'Dự đoán đã lưu'],[t.dung||0,'Đúng'],[t.sai||0,'Sai'],[rateTxt,'Tỉ lệ đúng']].map(([v,l])=>'<div class=\"metric\"><div class=\"num\">'+esc(v)+'</div><small>'+l+'</small></div>').join('');
-$('games').innerHTML=(d.games||[]).map(g=>{const s=g.thong_ke||{};const n=Math.max(0,Math.min(100,100*Number(g.sample_size||0)/Math.max(1,Number(g.required_samples||5))));return '<article class="game"><div class="ghead"><div class="gname">'+esc(g.name)+'</div><span class="status '+esc(g.status)+'">'+(statusText[g.status]||'Chưa rõ')+'</span></div><div class="progress"><div class="bar" style="width:'+n+'%"></div></div><div class="sample">Dữ liệu: '+Number(g.sample_size||0)+'/'+Number(g.required_samples||5)+' phiên hợp lệ</div><div class="stats"><div class="stat"><b class="wins">'+Number(s.dung||0)+'</b><span>Đúng</span></div><div class="stat"><b class="losses">'+Number(s.sai||0)+'</b><span>Sai</span></div><div class="stat"><b>'+Number(s.dang_cho||0)+'</b><span>Đang chờ</span></div><div class="stat"><b class="rate">'+esc(s.ti_le||'—')+'</b><span>Tỉ lệ đúng</span></div></div><nav class="links"><a href="'+esc(g.predict)+'">Xem dự đoán</a><a href="'+esc(g.history)+'">Lịch sử</a></nav>'+(g.error?'<div class="error-text">'+esc(g.error)+'</div>':'')+'</article>'}).join('')||'<div class="game muted">Chưa có game được cấu hình.</div>';
-}catch(e){$('updated').textContent='Không tải được dữ liệu';$('games').textContent='Lỗi tải tổng quan: '+e.message;}}
-load();setInterval(load,15000);
-</script></body></html>`;
-
-app.get('/overview', (_req, res) => res.json(buildOverview()));
-app.get('/', (req, res) => {
-  const accept = String(req && req.headers && req.headers.accept || '');
-  if (accept.includes('text/html')) return res.type('html').send(DASHBOARD_HTML);
-  return res.json(buildOverview());
+after(() => {
+  Module._load = originalLoad;
+  try { fs.rmSync(testDataDir, { recursive: true, force: true }); } catch (_) {}
 });
 
-app.get('/health', (_req, res) => {
-  res.json({ ok: true, id: IDOL, version: '4.0.0', time: nowVN(), games: Object.keys(GAMES).length, min_history_sessions: MIN_HISTORY_SESSIONS });
+test('MAX789 MD5: sample total 13 with declared Xỉu is corrected to Tài', () => {
+  const row = api.parseMax789({
+    id: '@htungdzvipmax',
+    Name: 'MAX789 MD5',
+    Phien: 1919916,
+    Xuc_xac: '5 - 2 - 6',
+    Tong: 13,
+    Ket_qua: 'Xỉu',
+    Cau_hien_tai: 'TTXXXXXTTTXXTTXXXXXX',
+    Phien_tiep: 1919917,
+    Du_doan: 'Xỉu',
+    Du_doan_side: 'X',
+    do_tin_cay: 54,
+    Ly_do: 'Đang bệt 6 phiên Xỉu',
+    Sample_size: 100,
+    Time: '11:58:06 26/11/2026'
+  })[0];
+  assert.equal(row.session, '1919916');
+  assert.deepEqual(row.dice, [5, 2, 6]);
+  assert.equal(row.sum, 13);
+  assert.equal(row.side, 'T');
+  assert.equal(row.sideSource, 'dice_sum');
+  assert.equal(row.nextSession, 1919917);
+  assert.match(row.dataWarning, /Ket_qua API Xỉu lệch/);
+  assert.equal(row.time, '2026-11-26T04:58:06.000Z');
+  assert.equal(row.apiSampleSize, 100);
 });
 
-app.get('/games', (_req, res) => {
-  const list = Object.entries(GAMES).map(([id, game]) => ({
-    id: IDOL,
-    game: id,
-    label: game.label,
-    type: game.type,
-    predict: `/${id}`,
-    history: `/${id}/history`,
-    status: lastStatus[id] && lastStatus[id].ok === true
-      ? (lastStatus[id].mode === 'protected' ? 'protected' : 'online')
-      : lastStatus[id] && lastStatus[id].ok === false ? 'error'
-        : lastStatus[id] && lastStatus[id].mode === 'learning' ? 'learning' : 'pending',
-    sample_size: lastStatus[id] && lastStatus[id].samples || 0,
-    required_samples: MIN_HISTORY_SESSIONS
+test('Dice sum wins over a conflicting reported total', () => {
+  const row = api.parseMax789({ data: [{
+    Phien: 12, Xuc_xac: '1 - 2 - 3', Tong: 13, Ket_qua: 'Tài'
+  }] })[0];
+  assert.equal(row.sum, 6);
+  assert.equal(row.side, 'X');
+  assert.match(row.dataWarning, /Tong API 13 lệch tổng xúc xắc 6/);
+  assert.match(row.dataWarning, /Ket_qua API Tài lệch/);
+});
+
+test('A three-dice triple is not silently classified as Tài or Xỉu', () => {
+  const row = api.parseMax789([{ Phien: 13, Xuc_xac: '6 - 6 - 6', Tong: 18, Ket_qua: 'Tài' }])[0];
+  assert.equal(row.side, null);
+  assert.equal(row.sideSource, 'triple');
+});
+
+test('LC79 parser reads and prioritizes dice evidence', () => {
+  const rows = api.parseLc79List({ list: [
+    { id: '103', dices: [2, 4, 6], point: 12, resultTruyenThong: 'TAI' },
+    { id: '102', dices: [1, 2, 3], point: 6, resultTruyenThong: 'XIU' }
+  ] });
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].session, '103');
+  assert.deepEqual(rows[0].dice, [2, 4, 6]);
+  assert.equal(rows[0].side, 'T');
+  assert.equal(rows[1].side, 'X');
+});
+
+test('Xocdia parser converts patterns to Vietnamese', () => {
+  const rows = api.parseLc79Xocdia({ list: [
+    { id: '20', dices: ['đỏ', 'đỏ', 'đỏ', 'trắng'], resultTruyenThong: 'LẺ', resultVi: 'three_do' },
+    { id: '19', dices: ['trắng', 'trắng', 'đỏ', 'đỏ'], resultTruyenThong: 'CHẴN', resultVi: 'two_trang' }
+  ] });
+  assert.equal(rows[0].side, 'LE');
+  assert.equal(rows[0].vi, '3 đỏ - 1 trắng');
+  assert.equal(rows[1].vi, '2 đỏ - 2 trắng');
+  const mismatch = api.parseLc79Xocdia({ list: [
+    { id: '21', dices: ['đỏ', 'đỏ', 'đỏ', 'trắng'], resultTruyenThong: 'CHẴN' }
+  ] })[0];
+  assert.equal(mismatch.side, 'LE');
+  assert.match(mismatch.dataWarning, /lệch mẫu màu 3 đỏ - 1 trắng/);
+  assert.equal(api.redCountFromVi('four_trang'), 0);
+  assert.equal(api.redCountFromVi('one_trang'), 3);
+  assert.equal(api.redCountFromVi('3 đỏ - 1 trắng'), 3);
+  const unknown = api.parseLc79Xocdia({ list: [{ id: '22', resultVi: 'odd_red_pattern' }] })[0];
+  assert.equal(unknown.vi, null);
+});
+
+test('MAX789 and Hitclub parsers support nested source JSON', () => {
+  const max = api.parseMax789({ data: [
+    { SessionId: 7, FirstDice: 6, SecondDice: 5, ThirdDice: 1, DiceSum: 12, BetSide: 1 }
+  ] });
+  assert.equal(max[0].side, 'T');
+  assert.equal(max[0].sum, 12);
+
+  const hitclub = api.parseHitclub({ data: { list: [
+    { Phien: 8, Xuc_xac_1: 1, Xuc_xac_2: 2, Xuc_xac_3: 3, Tong: 6, Ket_qua: 'Xỉu' }
+  ] } });
+  assert.equal(hitclub[0].session, '8');
+  assert.equal(hitclub[0].side, 'X');
+  assert.equal(hitclub[0].sum, 6);
+});
+
+test('Source history merges by session and returns newest-first', () => {
+  let rows = api.mergeSourceHistory('lc79/tx', [
+    { session: '105', side: 'T', sideSource: 'dice_sum' },
+    { session: '104', side: 'X', sideSource: 'dice_sum' },
+    { session: '103', side: 'T', sideSource: 'dice_sum' }
+  ]);
+  assert.deepEqual(rows.map(row => row.session), ['105', '104', '103']);
+  rows = api.mergeSourceHistory('lc79/tx', [
+    { session: '106', side: 'X', sideSource: 'dice_sum' },
+    { session: '105', side: null, sideSource: 'missing', dice: [] }
+  ]);
+  assert.deepEqual(rows.map(row => row.session), ['106', '105', '104', '103']);
+  assert.equal(rows[1].side, 'T');
+});
+
+test('Embedded sequence cannot overwrite legacy source results from v1/v2 files', () => {
+  api.mergeSourceHistory('legacy/test', [{ session: '199', side: 'T', dice: [], sum: null }]);
+  const rows = api.mergeSourceHistory('legacy/test', [{
+    session: '199', side: 'X', sideSource: 'embedded_cau', synthetic: true
+  }]);
+  assert.equal(rows[0].side, 'T');
+});
+
+test('Settled prediction is recalculated when source result is corrected', () => {
+  api._state.predHistory['max789/md5'] = [{
+    phien: '1919916', du_doan: 'Tài', pred_side: 'T', conf: 54,
+    actual: 'Xỉu', actual_side: 'X', ok: false, result_time: 'old'
+  }];
+  api.settlePredictionLogs('max789/md5', [{
+    session: '1919916', side: 'T', sideSource: 'dice_sum',
+    sum: 13, dice: [5, 2, 6], dataWarning: 'Ket_qua API Xỉu lệch kết quả tính từ xúc xắc Tài'
+  }]);
+  const row = api._state.predHistory['max789/md5'][0];
+  assert.equal(row.actual, 'Tài');
+  assert.equal(row.actual_side, 'T');
+  assert.equal(row.actual_dice, '5 - 2 - 6');
+  assert.equal(row.actual_sum, 13);
+  assert.equal(row.ok, true);
+  assert.match(row.data_warning, /Ket_qua API/);
+});
+
+test('History display includes session, dice, result and status icon', () => {
+  const row = {
+    phien: '500', du_doan: 'Tài', actual: 'Tài', actual_side: 'T',
+    actual_dice: '5 - 2 - 6', actual_sum: 13, ok: true, conf: 58
+  };
+  const formatted = api.formatHistoryRow(row, api.GAMES['max789/md5']);
+  assert.match(formatted, /Phiên 500/);
+  assert.match(formatted, /5 - 2 - 6/);
+  assert.match(formatted, /Tài/);
+  assert.match(formatted, /✅/);
+});
+
+test('Compact history row contains only session, actual result and verdict icon', () => {
+  const tx = api.formatCompactHistoryRow({
+    phien: '2992', actual: 'Tài', actual_dice: '6 - 4 - 2',
+    actual_sum: 12, du_doan: 'Xỉu', ly_do: 'internal only', conf: 55, ok: false
+  }, api.GAMES['lc79/tx']);
+  assert.deepEqual(tx, {
+    phien: 2992, d1: 6, d2: 4, d3: 2, ket_qua: 'Tài', icon: '❌'
+  });
+  const xocdia = api.formatCompactHistoryRow({
+    phien: '2991', actual: 'Lẻ', actual_vi: '3 đỏ - 1 trắng',
+    actual_dice: null, actual_sum: null, ok: true
+  }, api.GAMES['lc79/xocdia']);
+  assert.deepEqual(xocdia, {
+    phien: 2991, ket_qua: '3 đỏ - 1 trắng', chan_le: 'Lẻ', icon: '✅'
+  });
+  const pending = api.formatCompactHistoryRow({ phien: '2993', actual: null, ok: null }, api.GAMES['lc79/tx']);
+  assert.equal(pending, null);
+  const paused = api.formatCompactHistoryRow({ phien: '2994', risk_pause: true }, api.GAMES['lc79/tx']);
+  assert.equal(paused, null);
+});
+
+test('Prediction remains stable for an already-created target session', () => {
+  api._state.predHistory['betvip/tx'] = [];
+  api.pushPredLog('betvip/tx', { phien: '900', du_doan: 'Xỉu', pred_side: 'X', conf: 54, ok: null });
+  const result = api.pushPredLog('betvip/tx', { phien: '900', du_doan: 'Tài', pred_side: 'T', conf: 62, ok: null });
+  assert.equal(result.du_doan, 'Xỉu');
+});
+
+test('Engine learns embedded Cau_hien_tai sequence only when it matches latest result', () => {
+  const engine = new api.Engine('max789/md5', 'tx');
+  engine.loadHistory([{
+    session: '200', side: 'X', sum: 8, dice: [2, 2, 4],
+    cau: 'TTXXX'
+  }]);
+  assert.deepEqual(engine.history.map(row => row.side), ['T', 'T', 'X', 'X', 'X']);
+  const mismatch = new api.Engine('max789/md5', 'tx');
+  mismatch.loadHistory([{
+    session: '200', side: 'T', sum: 13, dice: [5, 2, 6],
+    cau: 'XTTXX'
+  }]);
+  assert.deepEqual(mismatch.history.map(row => row.side), ['T']);
+});
+
+test('Embedded Cau_hien_tai is imported as hidden source sessions only when anchored', () => {
+  const expanded = api.expandEmbeddedCauRows([{
+    session: '200', side: 'T', sideSource: 'dice_sum', cau: 'TTXXX'
+  }]);
+  assert.deepEqual(expanded.map(row => row.session), ['196', '197', '198', '199']);
+  assert.deepEqual(expanded.map(row => row.side), ['X', 'X', 'X', 'T']);
+  assert.ok(expanded.every(row => row.sideSource === 'embedded_cau' && row.synthetic === true));
+  assert.deepEqual(api.expandEmbeddedCauRows([{
+    session: '200', side: 'T', sideSource: 'dice_sum', cau: 'XTTXX'
+  }]), []);
+});
+
+test('Adaptive engine handles a long bệt without forcing an automatic reversal', () => {
+  const history = [];
+  for (let i = 1; i <= 160; i++) {
+    const side = i < 80 ? 'T' : (i % 2 ? 'T' : 'X');
+    history.push({ session: String(i), side, sum: side === 'T' ? 12 : 8, dice: [4, 4, 4] });
+  }
+  const engine = new api.Engine('lc79/tx', 'tx');
+  engine.loadHistory([...history].reverse());
+  const prediction = engine.predict();
+  assert.ok(['T', 'X'].includes(prediction.side));
+  assert.ok(prediction.conf >= 50 && prediction.conf <= 63);
+});
+
+test('History endpoint refreshes API data and settles the exact pending session', async () => {
+  api._state.predHistory['max789/md5'] = [
+    { phien: '1919916', du_doan: 'Tài', pred_side: 'T', conf: 54, actual: null, actual_side: null, actual_dice: null, ok: null },
+    { phien: '1919915', du_doan: 'Tài', pred_side: 'T', conf: 54, actual: null, actual_side: null, actual_dice: null, ok: null }
+  ];
+  axiosState.data = {
+    Name: 'MAX789 MD5', Phien: 1919916, Xuc_xac: '5 - 2 - 6',
+    Tong: 13, Ket_qua: 'Xỉu', Cau_hien_tai: 'TTXXX', Phien_tiep: 1919917
+  };
+  const handler = registeredRoutes.get('GET /:brand/:table/history');
+  assert.equal(typeof handler, 'function');
+  let responseBody = null;
+  const res = { statusCode: 200, status(code) { this.statusCode = code; return this; }, json(body) { responseBody = body; return this; } };
+  await handler({ params: { brand: 'max789', table: 'md5' } }, res);
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(Object.keys(responseBody), ['history']);
+  const settled = responseBody.history.find(item => String(item.phien) === '1919916');
+  assert.ok(settled);
+  assert.equal(settled.ket_qua, 'Tài');
+  assert.deepEqual([settled.d1, settled.d2, settled.d3], [5, 2, 6]);
+  assert.equal(settled.icon, '✅');
+  const embeddedSettled = responseBody.history.find(item => String(item.phien) === '1919915');
+  assert.ok(embeddedSettled);
+  assert.equal(embeddedSettled.ket_qua, 'Tài');
+  assert.equal(embeddedSettled.icon, '✅');
+  assert.equal('du_doan' in settled, false);
+  assert.equal('ly_do' in settled, false);
+  assert.equal('conf' in settled, false);
+  assert.equal('items' in responseBody, false);
+  axiosState.data = null;
+});
+
+test('Root dashboard exposes per-game stats and excludes Sunhot/Sunwin Sicbo', () => {
+  api._state.predHistory['lc79/tx'] = [
+    { phien: '3', ok: true, actual: 'Tài' },
+    { phien: '2', ok: false, actual: 'Xỉu' },
+    { phien: '1', ok: null, actual: null }
+  ];
+  const overview = api.buildOverview();
+  assert.equal(overview.games.some(game => game.game === 'sunhot/tx' || game.game === 'sunwin/sicbo'), false);
+  const lc79 = overview.games.find(game => game.game === 'lc79/tx');
+  assert.deepEqual(lc79.thong_ke, {
+    tong_phien: 3, dung: 1, sai: 1, dang_cho: 1,
+    tam_dung: 0, bo_qua: 0, ti_le_dung: 50, ti_le: '50%'
+  });
+  assert.match(api.DASHBOARD_HTML, /Danh sách game/);
+  assert.match(api.DASHBOARD_HTML, /Tỉ lệ đúng/);
+});
+
+test('Browser root returns a dashboard while API clients retain JSON overview', () => {
+  const root = registeredRoutes.get('GET /');
+  let html = '';
+  const htmlRes = {
+    type(value) { this.contentType = value; return this; },
+    send(value) { html = value; return this; },
+    json() { throw new Error('expected HTML response'); }
+  };
+  root({ headers: { accept: 'text/html,application/xhtml+xml' } }, htmlRes);
+  assert.equal(htmlRes.contentType, 'html');
+  assert.match(html, /PRED-API/);
+
+  let json = null;
+  const jsonRes = { json(value) { json = value; return this; } };
+  root({ headers: { accept: 'application/json' } }, jsonRes);
+  assert.equal(json.name, 'PRED-API');
+  assert.ok(Array.isArray(json.games));
+});
+
+test('/overview endpoint returns the same per-game statistics JSON used by the dashboard', () => {
+  const handler = registeredRoutes.get('GET /overview');
+  let body = null;
+  handler({}, { json(value) { body = value; return this; } });
+  assert.ok(Array.isArray(body.games));
+  const lc79 = body.games.find(game => game.game === 'lc79/tx');
+  assert.equal(lc79.thong_ke.dung, 1);
+  assert.equal(lc79.thong_ke.sai, 1);
+  assert.equal(lc79.thong_ke.ti_le, '50%');
+});
+
+test('Xoc Dia public cầu sequence is written as Vietnamese labels', () => {
+  assert.equal(api.formatCauForApi('CLLCCL', 'xocdia'), 'Chẵn → Lẻ → Lẻ → Chẵn → Chẵn → Lẻ');
+  assert.equal(api.formatCauForApi('TXTXT', 'tx'), 'TXTXT');
+});
+
+test('Retired Sunhot and Sunwin Sicbo endpoints are no longer registered as games', () => {
+  assert.equal(Object.hasOwn(api.GAMES, 'sunhot/tx'), false);
+  assert.equal(Object.hasOwn(api.GAMES, 'sunwin/sicbo'), false);
+  assert.equal(Object.hasOwn(api.PARSERS, 'sunhot'), false);
+  assert.equal(Object.hasOwn(api.PARSERS, 'sunwinSicbo'), false);
+});
+
+test('Xocdia prediction provides Vietnamese red-white pattern labels', () => {
+  const history = [];
+  for (let i = 1; i <= 100; i++) {
+    const red = [0, 1, 2, 3, 4][i % 5];
+    history.push({
+      session: String(i), side: red % 2 === 0 ? 'CHAN' : 'LE',
+      doCount: red, trangCount: 4 - red, vi: `${red} đỏ - ${4 - red} trắng`
+    });
+  }
+  const engine = new api.Engine('lc79/xocdia', 'xocdia');
+  engine.loadHistory([...history].reverse());
+  const prediction = engine.predict();
+  assert.ok(['Chẵn', 'Lẻ'].includes(prediction.label));
+  assert.ok(['3 đỏ - 1 trắng', '2 đỏ - 2 trắng', '1 đỏ - 3 trắng', '4 đỏ - 0 trắng', '0 đỏ - 4 trắng'].includes(prediction.vi));
+  assert.ok(['Chẵn', 'Lẻ'].includes(api.sideLabel(prediction.side)));
+  assert.match(prediction.vi, /đỏ - .*trắng/);
+  assert.ok(prediction.topVi.every(value => /đỏ - .*trắng/.test(value)));
+});
+
+test('Live Xoc Dia JSON is fully Vietnamese and does not expose dice or total fields', async () => {
+  axiosState.data = { list: [
+    { id: 105, dices: ['đỏ', 'đỏ', 'trắng', 'trắng'] },
+    { id: 104, dices: ['đỏ', 'trắng', 'trắng', 'trắng'] },
+    { id: 103, dices: ['đỏ', 'đỏ', 'đỏ', 'trắng'] },
+    { id: 102, dices: ['trắng', 'trắng', 'trắng', 'trắng'] },
+    { id: 101, dices: ['đỏ', 'đỏ', 'đỏ', 'đỏ'] }
+  ] };
+  const result = await poll('lc79/xocdia');
+  assert.equal(Object.hasOwn(result, 'Xuc_xac'), false);
+  assert.equal(Object.hasOwn(result, 'Tong'), false);
+  assert.equal(result.Ket_qua, '2 đỏ - 2 trắng');
+  assert.equal(result.Chan_le, 'Chẵn');
+  assert.ok(['Chẵn', 'Lẻ'].includes(result.Du_doan));
+  assert.ok(['Chẵn', 'Lẻ'].includes(result.Du_doan_side));
+  assert.match(result.Vi, /đỏ - .*trắng/);
+  assert.match(result.Du_doan_vi, /đỏ - .*trắng/);
+  assert.ok(result.Top_vi.every(value => /đỏ - .*trắng/.test(value)));
+  assert.ok(result.Top_vi_chi_tiet.every(item => Object.hasOwn(item, 'ti_le') && !Object.hasOwn(item, 'probability')));
+  assert.ok(result.Cau_hien_tai.includes('Chẵn') || result.Cau_hien_tai.includes('Lẻ'));
+  axiosState.data = null;
+});
+
+test('Every game has an independent model profile (not the LC79 profile reused)', () => {
+  const ids = Object.keys(api.GAMES);
+  for (const id of ids) assert.ok(api.MODEL_PROFILES[id], `Missing profile for ${id}`);
+  assert.notEqual(api.getModelProfile('lc79/tx').name, api.getModelProfile('max789/md5').name);
+  assert.equal(ids.some(id => id.startsWith('sunhot/') || id.startsWith('sunwin/')), false);
+  assert.notEqual(api.getModelProfile('lc79/md5').weights.pattern, api.getModelProfile('max789/md5').weights.pattern);
+});
+
+test('A game with fewer than five source sessions remains in warm-up and emits no fake forecast', async () => {
+  api._state.predHistory['max789/kubet'] = [];
+  let result;
+  // This simulates a provider that exposes only the current result, not a history array.
+  for (let session = 101; session <= 104; session++) {
+    axiosState.data = {
+      Phien: session,
+      Phien_tiep: session + 1,
+      Xuc_xac: session % 2 ? '2 - 3 - 4' : '1 - 2 - 3',
+      Tong: session % 2 ? 9 : 6,
+      Ket_qua: session % 2 ? 'Xỉu' : 'Xỉu'
+    };
+    result = await poll('max789/kubet');
+    assert.equal(result.Trang_thai, 'DANG_HOC_DU_LIEU');
+    assert.equal(result.Sample_size, session - 100);
+    assert.equal(result.Du_doan, null);
+  }
+  assert.equal(result.Is_ready, false);
+  assert.equal(result.Sample_size, 4);
+  assert.equal(result.Con_thieu, 1);
+  assert.equal(result.Du_doan_side, null);
+  assert.equal(api._state.predHistory['max789/kubet'].length, 0);
+});
+
+test('A game starts forecasting only after the fifth distinct valid session is saved', async () => {
+  // Only the fifth current result is returned; the previous four must have been retained locally.
+  axiosState.data = {
+    Phien: 105, Phien_tiep: 106, Xuc_xac: '4 - 4 - 5', Tong: 13, Ket_qua: 'Tài'
+  };
+  const result = await poll('max789/kubet');
+  assert.equal(result.Trang_thai, 'DA_SAN_SANG');
+  assert.equal(result.Is_ready, true);
+  assert.equal(result.Sample_size, 5);
+  assert.ok(['Tài', 'Xỉu'].includes(result.Du_doan));
+  assert.equal(result.Phien_tiep, 106);
+  assert.equal(api._state.predHistory['max789/kubet'].length, 1);
+});
+
+test('Three consecutive settled misses trigger one protected skipped session, then learning resumes', async () => {
+  api._state.predHistory['betvip/tx'] = [
+    { phien: '206', du_doan: 'Tài', pred_side: 'T', actual: 'Xỉu', actual_side: 'X', ok: false },
+    { phien: '205', du_doan: 'Xỉu', pred_side: 'X', actual: 'Tài', actual_side: 'T', ok: false },
+    { phien: '204', du_doan: 'Tài', pred_side: 'T', actual: 'Xỉu', actual_side: 'X', ok: false }
+  ];
+  axiosState.data = [
+    { Phien: 304, Xuc_xac_1: 4, Xuc_xac_2: 4, Xuc_xac_3: 5, Tong: 13, Ket_qua: 'Tài', Phien_tiep: 305 },
+    { Phien: 303, Xuc_xac_1: 1, Xuc_xac_2: 2, Xuc_xac_3: 3, Tong: 6, Ket_qua: 'Xỉu' },
+    { Phien: 302, Xuc_xac_1: 2, Xuc_xac_2: 3, Xuc_xac_3: 4, Tong: 9, Ket_qua: 'Xỉu' },
+    { Phien: 301, Xuc_xac_1: 5, Xuc_xac_2: 4, Xuc_xac_3: 3, Tong: 12, Ket_qua: 'Tài' },
+    { Phien: 300, Xuc_xac_1: 1, Xuc_xac_2: 3, Xuc_xac_3: 4, Tong: 8, Ket_qua: 'Xỉu' }
+  ];
+  const paused = await poll('betvip/tx');
+  assert.equal(paused.Trang_thai, 'TAM_DUNG_BAO_VE');
+  assert.equal(paused.Du_doan, null);
+  assert.equal(paused.Consecutive_losses, 3);
+  assert.equal(api._state.predHistory['betvip/tx'][0].risk_pause, true);
+
+  axiosState.data = [
+    { Phien: 305, Xuc_xac_1: 6, Xuc_xac_2: 2, Xuc_xac_3: 4, Tong: 12, Ket_qua: 'Tài', Phien_tiep: 306 },
+    { Phien: 304, Xuc_xac_1: 4, Xuc_xac_2: 4, Xuc_xac_3: 5, Tong: 13, Ket_qua: 'Tài' },
+    { Phien: 303, Xuc_xac_1: 1, Xuc_xac_2: 2, Xuc_xac_3: 3, Tong: 6, Ket_qua: 'Xỉu' },
+    { Phien: 302, Xuc_xac_1: 2, Xuc_xac_2: 3, Xuc_xac_3: 4, Tong: 9, Ket_qua: 'Xỉu' },
+    { Phien: 301, Xuc_xac_1: 5, Xuc_xac_2: 4, Xuc_xac_3: 3, Tong: 12, Ket_qua: 'Tài' },
+    { Phien: 300, Xuc_xac_1: 1, Xuc_xac_2: 3, Xuc_xac_3: 4, Tong: 8, Ket_qua: 'Xỉu' }
+  ];
+  const resumed = await poll('betvip/tx');
+  assert.equal(resumed.Trang_thai, 'DA_SAN_SANG');
+  assert.ok(['Tài', 'Xỉu'].includes(resumed.Du_doan));
+  assert.equal(resumed.Phien_tiep, 306);
+});
+
+test('Risk-pause history is labeled separately and is not counted as a loss', () => {
+  const row = { phien: '888', du_doan: 'Tạm dừng bảo vệ', risk_pause: true, pause_reason: 'test', ok: null };
+  assert.match(api.formatHistoryRow(row, api.GAMES['lc79/tx']), /TẠM DỪNG BẢO VỆ/);
+  api._state.predHistory['max789/kubet'] = [row,
+    { phien: '887', du_doan: 'Tài', pred_side: 'T', ok: false },
+    { phien: '886', du_doan: 'Tài', pred_side: 'T', ok: false }
+  ];
+  assert.equal(api.consecutiveLossState('max789/kubet').count, 0);
+});
+
+/* ===================== Regression tests for audit fixes ===================== */
+
+test('Xoc Dia reason text uses Chẵn/Lẻ and never Tài/Xỉu', () => {
+  const pattern = [1, 3, 1, 1, 3, 1, 3, 1, 1, 1, 3, 1, 3, 3, 1, 1, 1, 3, 1, 3];
+  const rows = pattern.map((red, i) => ({
+    session: String(9000 - i), side: red % 2 === 0 ? 'CHAN' : 'LE',
+    sideSource: 'derived_color', doCount: red, vi: api.formatXocdia(red),
+    dice: [], sum: null, time: null
   }));
-  res.json({ id: IDOL, ok: true, total: list.length, min_history_sessions: MIN_HISTORY_SESSIONS, games: list });
+  const engine = new api.Engine('lc79/xocdia', 'xocdia');
+  engine.loadHistory(rows);
+  const result = engine.predict();
+  assert.equal(result.ready, undefined, 'engine should be ready with 20 samples');
+  assert.ok(['Chẵn', 'Lẻ'].includes(result.label));
+  assert.doesNotMatch(result.lyDo, /Tài|Xỉu|xúc|tổng/i);
+  assert.match(result.lyDo, /Chẵn|Lẻ/);
 });
 
-// Legacy formatter remains exported for older direct consumers. The /history
-// endpoint below exclusively uses the compact formatter and never exposes this.
-function formatHistoryRow(entry, game) {
-  const phien = entry.phien != null ? String(entry.phien) : '—';
-  if (entry.risk_pause === true) {
-    return `Phiên ${phien} | TẠM DỪNG BẢO VỆ: ${entry.pause_reason || 'nghỉ 1 phiên sau chuỗi sai'} | ⏸️`;
-  }
-  const prediction = entry.du_doan || '—';
-  const mark = entry.void === true ? '➖' : entry.ok === true ? '✅' : entry.ok === false ? '❌' : '⏳';
-  const actual = entry.actual || 'Đang chờ';
-  const dice = entry.actual_dice ? ` | KQ xúc xắc: ${entry.actual_dice}` : '';
-  const sum = entry.actual_sum != null && game.type !== 'xocdia' ? ` (${entry.actual_sum})` : '';
-  const conf = entry.conf != null ? ` | ${entry.conf}%` : '';
-  return `Phiên ${phien}${dice} | KQ: ${actual}${sum} | Dự đoán: ${prediction} | ${mark}${conf}`;
-}
-
-function historyIcon(entry) {
-  if (!entry) return '➖';
-  if (entry.prediction_missing === true || entry.void === true) return '➖';
-  if (entry.risk_pause === true) return '⏸️';
-  if (entry.ok === true) return '✅';
-  if (entry.ok === false) return '❌';
-  return '⏳';
-}
-
-function formatCompactHistoryRow(entry, game) {
-  if (!entry || entry.phien == null) return null;
-  // Chỉ đưa phiên đã có kết quả thật vào /history; phiên dự đoán đang chờ
-  // sẽ xuất hiện sau khi nguồn chốt phiên.
-  const hasActual = entry.actual != null || entry.actual_vi != null || entry.actual_dice != null;
-  if (!hasActual) return null;
-
-  const sessionText = String(entry.phien);
-  const sessionNumber = Number(sessionText);
-  const sessionValue = /^\d+$/.test(sessionText) && Number.isSafeInteger(sessionNumber)
-    ? sessionNumber : entry.phien;
-  const row = { phien: sessionValue };
-  if (game.type === 'xocdia') {
-    // Xóc Đĩa là bốn quân đỏ/trắng, không phải xúc xắc.
-    row.ket_qua = entry.actual_vi || '—';
-    row.chan_le = entry.actual || '—';
-  } else {
-    const dice = String(entry.actual_dice || '').match(/[1-6]/g) || [];
-    if (dice.length === 3) {
-      row.d1 = Number(dice[0]);
-      row.d2 = Number(dice[1]);
-      row.d3 = Number(dice[2]);
-    }
-    row.ket_qua = entry.actual || '—';
-  }
-  row.icon = historyIcon(entry);
-  return row;
-}
-
-// Dựng lịch sử từ DỮ LIỆU NGUỒN (không chỉ từ log dự đoán), để một phiên không
-// biến mất chỉ vì lần poll trước đã bỏ lỡ hoặc phiên đó bị tạm dừng bảo vệ.
-// Log dự đoán chỉ bổ sung trạng thái đúng/sai/tạm dừng cho phiên tương ứng.
-function buildGameHistory(gameId, game) {
-  const logs = Array.isArray(predHistory[gameId]) ? predHistory[gameId] : [];
-  const byPhien = new Map();
-  for (const log of logs) if (log && log.phien != null) byPhien.set(String(log.phien), log);
-
-  let source = sourceCache[gameId];
-  if (!Array.isArray(source)) {
-    const stored = loadJSON(sourceFile(gameId), []);
-    source = Array.isArray(stored) ? [...stored].reverse() : [];
-  }
-
-  const entries = new Map();
-  for (const row of source) {
-    if (!row || row.session == null) continue;
-    if (!row.side && row.sideSource !== 'triple') continue;
-    const phien = String(row.session);
-    const log = byPhien.get(phien);
-    entries.set(phien, {
-      phien,
-      actual: row.sideSource === 'triple' ? 'Bộ ba' : sideLabel(row.side),
-      actual_dice: game.type === 'xocdia'
-        ? (row.vi || (Number.isInteger(row.doCount) ? formatXocdia(row.doCount) : null))
-        : (Array.isArray(row.dice) && row.dice.length === 3 ? row.dice.join(' - ') : null),
-      actual_vi: game.type === 'xocdia'
-        ? (row.vi || (Number.isInteger(row.doCount) ? formatXocdia(row.doCount) : null))
-        : null,
-      ok: log ? log.ok : null,
-      void: log ? log.void === true : row.sideSource === 'triple',
-      risk_pause: log ? log.risk_pause === true : false,
-      prediction_missing: !log
-    });
-  }
-  // Phiên đã có log nhưng nguồn chưa còn trong bộ đệm: vẫn giữ nếu có kết quả thật.
-  for (const log of logs) {
-    const phien = String(log.phien);
-    if (entries.has(phien)) continue;
-    if (log.actual == null && log.actual_vi == null && log.actual_dice == null) continue;
-    entries.set(phien, { ...log, phien });
-  }
-
-  const ordered = Array.from(entries.values()).sort((a, b) => {
-    if (isNumericSession(a.phien) && isNumericSession(b.phien)) {
-      const aa = BigInt(a.phien), bb = BigInt(b.phien);
-      return aa > bb ? -1 : aa < bb ? 1 : 0;
-    }
-    return String(b.phien).localeCompare(String(a.phien));
+test('Protected-skip session stays in /history with its real result and no win/loss', () => {
+  const gameId = 'lc79/xocdia';
+  const game = api.GAMES[gameId];
+  const src = (session, red) => ({
+    session, side: red % 2 === 0 ? 'CHAN' : 'LE', sideSource: 'derived_color',
+    doCount: red, vi: api.formatXocdia(red), dataWarning: null, dice: [], sum: null, time: null
   });
-  return ordered.slice(0, PRED_LIMIT)
-    .map(entry => formatCompactHistoryRow(entry, game))
-    .filter(Boolean);
-}
-
-app.get('/:brand/:table/history', async (req, res) => {
-  const gameId = `${req.params.brand}/${req.params.table}`;
-  const game = GAMES[gameId];
-  if (!game) return res.status(404).json({ ok: false, error: 'Game không tồn tại' });
-  try {
-    // Giữ nguyên cơ chế tự làm mới và khóa request của v4.0.
-    await runPredict(gameId);
-  } catch (error) {
-    // Khi API nguồn tạm lỗi, vẫn trả lịch sử đã lưu.
-    console.error('[HISTORY_REFRESH]', gameId, error.message);
-  }
-  const history = buildGameHistory(gameId, game);
-  // /history chỉ chứa các dòng kết quả thực tế, không trả dự đoán, lý do,
-  // độ tin cậy, thống kê phụ hoặc dữ liệu phân tích nội bộ.
-  res.json({ history });
+  // Newest first, as the source returns it.
+  const rows = [src('8128126', 1), src('8128125', 2), src('8128124', 3)];
+  api._state.sourceCache[gameId] = rows;
+  api._state.predHistory[gameId] = [
+    { phien: '8128126', du_doan: 'Lẻ', pred_side: 'LE', conf: 55, ok: null, void: false },
+    { phien: '8128125', du_doan: 'Tạm dừng bảo vệ', pred_side: null, conf: null, risk_pause: true, ok: null },
+    { phien: '8128124', du_doan: 'Chẵn', pred_side: 'CHAN', conf: 52, ok: null, void: false }
+  ];
+  api.settlePredictionLogs(gameId, rows);
+  const history = api.buildGameHistory(gameId, game);
+  assert.deepEqual(history.map(row => row.phien), [8128126, 8128125, 8128124],
+    'skipped session 8128125 must not disappear from history');
+  const skipped = history.find(row => row.phien === 8128125);
+  assert.equal(skipped.chan_le, 'Chẵn');
+  assert.equal(skipped.icon, '⏸️');
+  // Stats must not count the protected skip as a loss.
+  const stats = api.getGamePredictionStats(gameId);
+  assert.equal(stats.sai + stats.dung, 2);
+  assert.equal(stats.tam_dung, 1);
 });
 
-app.get('/:brand/:table', async (req, res) => {
-  const gameId = `${req.params.brand}/${req.params.table}`;
-  if (!GAMES[gameId]) {
-    return res.status(404).json({ ok: false, error: 'Game không tồn tại', tip: 'Xem GET / hoặc GET /games' });
-  }
-  try {
-    const data = await runPredict(gameId);
-    res.json(data);
-  } catch (error) {
-    console.error('[PREDICT]', gameId, error.message);
-    res.status(502).json({
-      id: IDOL,
-      ok: false,
-      game: gameId,
-      error: 'Không lấy được dữ liệu nguồn',
-      detail: error.message,
-      Time: nowVN()
-    });
-  }
-});
-
-/* ================================ START ================================== */
-let server = null;
-if (require.main === module) {
-  server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`PRED-API v4.0 on :${PORT}`);
-    console.log('Polling:', POLL_MS, 'ms');
-    console.log('Games:', Object.keys(GAMES).join(', '));
+test('/history also lists source sessions that were never logged as forecasts', () => {
+  const gameId = 'lc79/xocdia';
+  const game = api.GAMES[gameId];
+  const src = (session, red) => ({
+    session, side: red % 2 === 0 ? 'CHAN' : 'LE', sideSource: 'derived_color',
+    doCount: red, vi: api.formatXocdia(red), dataWarning: null, dice: [], sum: null, time: null
   });
-  startPolling();
-}
+  const rows = [src('700', 3), src('699', 2)];
+  api._state.sourceCache[gameId] = rows;
+  api._state.predHistory[gameId] = [];
+  const history = api.buildGameHistory(gameId, game);
+  assert.deepEqual(history.map(row => row.phien), [700, 699]);
+  assert.equal(history[0].ket_qua, '3 đỏ - 1 trắng');
+  assert.equal(history[0].icon, '➖', 'no forecast recorded: neutral icon, never a fake verdict');
+});
 
-module.exports = {
-  app, GAMES, PARSERS, Engine, mergeSourceHistory,
-  parseLc79List, parseLc79Xocdia, parseHitclub, parseMax789,
-  modelProbability, MODEL_PROFILES, getModelProfile,
-  formatXocdia, redCountFromVi, sideLabel, sideFromSum, formatCauForApi,
-  getSum, resolveTxOutcome,
-  settlePredictionLogs, pushPredLog, formatHistoryRow, formatCompactHistoryRow, buildGameHistory, fetchGame, runPredict, expandEmbeddedCauRows,
-  consecutiveLossState, getGamePredictionStats, buildOverview, DASHBOARD_HTML,
-  analyzeCauStructure, detectCycle, detectDaoPattern, entropyOfSides, switchRate,
-  _state: { engines, predHistory, lastStatus, sourceCache, recentOk }
-};
+test('A three-dice triple shows Bộ ba instead of null Ket_qua', async () => {
+  axiosState.data = { list: [{ session: 5000, Xuc_xac: '1 - 1 - 1', Ket_qua: null }] };
+  const result = await poll('betvip/tx');
+  assert.equal(result.Ket_qua, 'Bộ ba');
+  assert.equal(result.Xuc_xac, '1 - 1 - 1');
+});
+
+test('Corrupt source file is backed up before a new write can overwrite it', () => {
+  const gameId = 'lc79/md5';
+  const file = path.join(testDataDir, `source_${gameId.replace('/', '_')}.json`);
+  fs.writeFileSync(file, '[{"session":"1","side":"T"', 'utf8'); // truncated JSON
+  const merged = api.mergeSourceHistory(gameId, [{ session: '2', side: 'X', sideSource: 'dice_sum', dice: [1, 2, 3], sum: 6 }]);
+  assert.equal(merged.length, 1);
+  const backups = fs.readdirSync(testDataDir).filter(name => name.startsWith(`source_${gameId.replace('/', '_')}.json.corrupt-`));
+  assert.equal(backups.length, 1, 'the corrupted file must be preserved as a .corrupt- backup');
+  assert.match(fs.readFileSync(path.join(testDataDir, backups[0]), 'utf8'), /"session":"1"/);
+});
+
+test('Embedded cầu rows never stamp synthetic:true onto a real session', () => {
+  const gameId = 'hitclub/md5';
+  api.mergeSourceHistory(gameId, [{ session: '500', side: 'T', sideSource: 'dice_sum', dice: [4, 5, 6], sum: 15 }]);
+  api.mergeSourceHistory(gameId, [
+    { session: '499', side: 'X', sideSource: 'embedded_cau', synthetic: true, dice: [], sum: null, time: null },
+    { session: '500', side: 'X', sideSource: 'embedded_cau', synthetic: true, dice: [], sum: null, time: null }
+  ]);
+  const file = path.join(testDataDir, 'source_hitclub_md5.json');
+  const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const real = stored.find(row => row.session === '500');
+  assert.equal(real.side, 'T', 'a weaker embedded label must not override the real outcome');
+  assert.equal(real.sideSource, 'dice_sum');
+  assert.notEqual(real.synthetic, true, 'real session must not be flagged synthetic');
+  const hidden = stored.find(row => row.session === '499');
+  assert.equal(hidden.synthetic, true, 'purely embedded session keeps its synthetic flag');
+});
+
+test('Fresh source result is reused briefly so bursts of requests do not each hit the source', async () => {
+  const gameId = 'hitclub/tx';
+  delete api._state.recentOk[gameId];
+  axiosState.data = { list: [{ session: 7000, Xuc_xac: '2 - 3 - 4', Ket_qua: 'Tài' }] };
+  const first = await api.runPredict(gameId);
+  axiosState.data = { list: [{ session: 7001, Xuc_xac: '5 - 5 - 6', Ket_qua: 'Tài' }] };
+  const second = await api.runPredict(gameId);
+  assert.equal(second, first, 'second call inside the cache window returns the same payload');
+  delete api._state.recentOk[gameId];
+  const third = await api.runPredict(gameId);
+  assert.equal(third.Phien, 7001, 'after the window the source is read again');
+});
+
+test('Engine no longer fabricates a forecast when history is insufficient', () => {
+  const engine = new api.Engine('betvip/tx', 'tx');
+  engine.loadHistory([]);
+  const result = engine.predict();
+  assert.equal(result.ready, false);
+  assert.equal(result.side, undefined);
+  assert.equal(result.label, undefined);
+});
+
+test('Capital Vietnamese colour Đỏ is recognised (Xóc Đĩa sides are not dropped)', () => {
+  const rows = api.parseLc79Xocdia({ list: [
+    { session: 11, dices: ['Đỏ', 'Trắng', 'Đỏ', 'Trắng'] },
+    { session: 12, dices: ['đỏ', 'trắng', 'trắng', 'trắng'] },
+    { session: 13, dices: ['Trắng', 'Trắng', 'Trắng', 'Trắng'] }
+  ] });
+  const bySession = Object.fromEntries(rows.map(row => [row.session, row]));
+  assert.equal(bySession['11'].doCount, 2);
+  assert.equal(bySession['11'].side, 'CHAN');
+  assert.equal(bySession['12'].doCount, 1);
+  assert.equal(bySession['12'].side, 'LE');
+  assert.equal(bySession['13'].doCount, 0);
+  assert.equal(bySession['13'].side, 'CHAN');
+});
+
+/* ===================== New tests for advanced cầu analysis ===================== */
+test('analyzeCauStructure detects long bệt', () => {
+  const sides = ['X','X','T','T','T','T','T','T','T'];
+  const info = api.analyzeCauStructure(sides);
+  assert.equal(info.regime, 'BET');
+  assert.equal(info.run, 7);
+  assert.ok(info.stability >= 0.7);
+});
+
+test('analyzeCauStructure detects 1-1 đảo', () => {
+  const sides = ['T','X','T','X','T','X','T','X','T','X'];
+  const info = api.analyzeCauStructure(sides);
+  assert.equal(info.regime, 'DAO_11');
+  assert.ok(info.stability >= 0.9);
+});
+
+test('analyzeCauStructure detects cycle period 2', () => {
+  const sides = ['T','X','T','X','T','X','T','X','T','X','T','X'];
+  const info = api.analyzeCauStructure(sides);
+  // Can be DAO_11 or CYCLE depending on order of checks
+  assert.ok(info.regime === 'DAO_11' || (info.regime === 'CYCLE' && info.cycle && info.cycle.period === 2));
+});
+
+test('analyzeCauStructure marks mixed / high switch', () => {
+  const sides = ['T','X','T','T','X','T','X','X','T','X','T','X','T'];
+  const info = api.analyzeCauStructure(sides);
+  assert.ok(['MIXED', 'CUM', 'DAO_11', 'BET'].includes(info.regime));
+  assert.ok(typeof info.switchRate === 'number');
+  assert.ok(typeof info.entropy === 'number');
+});
+
+test('modelProbability exposes regime and cauStructure', () => {
+  const history = [];
+  for (let i = 0; i < 30; i++) {
+    history.push({ session: String(1000 + i), side: i % 2 === 0 ? 'T' : 'X', sum: 10 + (i % 5), dice: [1, 2, 3 + (i % 3)] });
+  }
+  const model = api.modelProbability(history, 'tx', 'lc79/tx');
+  assert.ok(model);
+  assert.ok(model.regime);
+  assert.ok(model.cauStructure);
+  assert.ok(model.cauStructure.description);
+});
+
+test('MAX789 profile remains independent and unchanged in structure', () => {
+  const p = api.getModelProfile('max789/tx');
+  assert.equal(p.name, 'max789-tx-longer-context');
+  assert.equal(p.shortWindow, 18);
+  assert.equal(p.mediumWindow, 48);
+  assert.equal(p.longWindow, 112);
+  assert.ok(p.weights.markov1 >= 0.12);
+});
+
+
+test('2-2 bridge detection is phase-independent when the analysis window starts mid-run', () => {
+  const sequence = [...'TTXX'.repeat(6)].slice(1, 17);
+  const detected = api.detectDaoPattern(sequence);
+  assert.ok(detected);
+  assert.equal(detected.type, 'DAO_22');
+});
+
+test('CUM detection only accepts a pattern anchored at the end of the current sequence', () => {
+  const currentPattern = [...'TTXTTX'];
+  assert.equal(api.detectCumPattern(currentPattern).name, '2-1');
+  const oldPatternNowBroken = [...'TTXTTXTTXTTT'];
+  assert.equal(api.detectCumPattern(oldPatternNowBroken), null,
+    'an old pattern in the middle of the window must not label a broken current tail as CUM');
+});
+
+test('Cycle forecast returns a shrunken next-side probability for a repeated period-3 sequence', () => {
+  const sequence = [...'TXX'.repeat(15)];
+  const probability = api.cycleForecastRate(sequence, { cyclePrior: 8, cycleMaxPeriod: 6 });
+  assert.ok(probability > 0.65 && probability < 0.99, `unexpected probability: ${probability}`);
+});
+
+test('Cycle component is enabled for LC79 but not injected into MAX789', () => {
+  const sequence = [...'TXX'.repeat(20)];
+  const history = sequence.map((side, index) => ({
+    session: String(10000 + index), side, sum: side === 'T' ? 12 : 9, dice: [2, 3, side === 'T' ? 6 : 4]
+  }));
+  const lc79 = api.modelProbability(history, 'tx', 'lc79/tx');
+  const max789 = api.modelProbability(history, 'tx', 'max789/tx');
+  assert.ok(lc79.components.some(row => row.key === 'cycle'));
+  assert.ok(!max789.components.some(row => row.key === 'cycle'));
+  assert.equal(api.getModelProfile('max789/tx').weights.cycle, undefined);
+});
