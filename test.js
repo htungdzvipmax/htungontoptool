@@ -660,3 +660,37 @@ test('MAX789 profile remains independent and unchanged in structure', () => {
   assert.equal(p.longWindow, 112);
   assert.ok(p.weights.markov1 >= 0.12);
 });
+
+
+test('2-2 bridge detection is phase-independent when the analysis window starts mid-run', () => {
+  const sequence = [...'TTXX'.repeat(6)].slice(1, 17);
+  const detected = api.detectDaoPattern(sequence);
+  assert.ok(detected);
+  assert.equal(detected.type, 'DAO_22');
+});
+
+test('CUM detection only accepts a pattern anchored at the end of the current sequence', () => {
+  const currentPattern = [...'TTXTTX'];
+  assert.equal(api.detectCumPattern(currentPattern).name, '2-1');
+  const oldPatternNowBroken = [...'TTXTTXTTXTTT'];
+  assert.equal(api.detectCumPattern(oldPatternNowBroken), null,
+    'an old pattern in the middle of the window must not label a broken current tail as CUM');
+});
+
+test('Cycle forecast returns a shrunken next-side probability for a repeated period-3 sequence', () => {
+  const sequence = [...'TXX'.repeat(15)];
+  const probability = api.cycleForecastRate(sequence, { cyclePrior: 8, cycleMaxPeriod: 6 });
+  assert.ok(probability > 0.65 && probability < 0.99, `unexpected probability: ${probability}`);
+});
+
+test('Cycle component is enabled for LC79 but not injected into MAX789', () => {
+  const sequence = [...'TXX'.repeat(20)];
+  const history = sequence.map((side, index) => ({
+    session: String(10000 + index), side, sum: side === 'T' ? 12 : 9, dice: [2, 3, side === 'T' ? 6 : 4]
+  }));
+  const lc79 = api.modelProbability(history, 'tx', 'lc79/tx');
+  const max789 = api.modelProbability(history, 'tx', 'max789/tx');
+  assert.ok(lc79.components.some(row => row.key === 'cycle'));
+  assert.ok(!max789.components.some(row => row.key === 'cycle'));
+  assert.equal(api.getModelProfile('max789/tx').weights.cycle, undefined);
+});
