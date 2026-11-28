@@ -27,22 +27,25 @@ const API_ID = String(process.env.API_ID || "@htungdzvipmax").trim() || "@htungd
 const POLL_MS = Math.max(8000, Number(process.env.POLL_MS) || 15000);
 const FETCH_TIMEOUT_MS = Math.max(3000, Number(process.env.FETCH_TIMEOUT_MS) || 12000);
 const SOURCE_LIMIT = Math.max(100, Math.min(5000, Number(process.env.SOURCE_LIMIT) || 1500));
-const FEED_LIMIT = Math.max(100, Math.min(5000, Number(process.env.FEED_LIMIT) || 1500));
+const FEED_LIMIT = Math.max(10, Math.min(200, Number(process.env.FEED_LIMIT) || 50));
 const MIN_HISTORY = 15;
 const ALGO_VERSION = "byhaquoc_v8.0_meanrev_adaptive_chop";
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
-// Giữ đúng danh sách game thuộc hai cổng LC79 và MAX789.
-// Xóc Đĩa được giữ làm bảng kết quả riêng; lõi byhaquoc là Tài/Xỉu 3 xúc xắc,
-// không áp nhầm logic Tài/Xỉu vào Chẵn/Lẻ Xóc Đĩa.
+// LC79 + MAX789 — chỉ Tài/Xỉu (3 xúc xắc). Không dùng Xóc Đĩa.
 const GAMES = {
   "lc79/tx": { label: "LC79 · Tài Xỉu", brand: "LC79", type: "tx", parser: "tx", url: "https://wtx.tele68.com/v1/tx/lite-sessions?cp=R&cl=R&pf=web&at=" },
   "lc79/md5": { label: "LC79 · MD5", brand: "LC79", type: "tx", parser: "tx", url: "https://wtxmd52.tele68.com/v1/txmd5/sessions?cp=R&cl=R&pf=web&at=4d3971b6956a5309f02b8bf55c093399" },
-  "lc79/xocdia": { label: "LC79 · Xóc Đĩa", brand: "LC79", type: "xocdia", parser: "xocdia", url: "https://wcl.tele68.com/v1/chanlefull/lite-sessions" },
   "max789/tx": { label: "MAX789 · Tài Xỉu", brand: "MAX789", type: "tx", parser: "max", url: "https://taixiu.maksh3979madfw.com/api/luckydice/GetSoiCau" },
   "max789/md5": { label: "MAX789 · MD5", brand: "MAX789", type: "tx", parser: "max", url: "https://taixiumd5.maksh3979madfw.com/api/md5luckydice/GetSoiCau" },
   "max789/kubet": { label: "MAX789 · Kubet", brand: "MAX789", type: "tx", parser: "max", url: "https://txkubet.maksh3979madfw.com/api/taixiukubet/GetSoiCau" }
 };
+
+function sideLabel(code) {
+  if (code === "TAI") return "Tài";
+  if (code === "XIU") return "Xỉu";
+  return code || "Không rõ";
+}
 
 const sourceStore = Object.create(null);
 const predictionStore = Object.create(null);
@@ -296,32 +299,37 @@ function settlePredictions(gameId, rows) {
 }
 function getCurrentRecord(gameId) {
   const logs = predictionStore[gameId] || [];
-  return logs[0] || null;
+  return logs.length ? logs[logs.length - 1] : null;
 }
 function predictionRecordForApi(record) {
   if (!record) return null;
+  const kq = record.ket_qua;
   return {
-    id: record.id,
+    id: record.id || API_ID,
     phien: sessionOutput(record.phien),
-    ket_qua: record.ket_qua,
-    xuc_xac: record.xuc_xac,
+    ket_qua: kq === "TAI" || kq === "XIU" ? sideLabel(kq) : (kq || "Không rõ"),
+    xuc_xac: Array.isArray(record.xuc_xac) ? record.xuc_xac : [],
     phien_du_doan: sessionOutput(record.phien_du_doan),
     du_doan: record.du_doan,
     do_tin_cay: record.do_tin_cay,
-    icon: record.icon
+    icon: record.icon || "⏳"
   };
 }
 function makeOutputPayload(gameId, latest, prediction) {
   return {
     id: API_ID,
     phien: sessionOutput(latest.session),
-    ket_qua: latest.resultTruyenThong || (latest.isTriple ? "Bộ ba" : "Không rõ"),
+    ket_qua: latest.isTriple ? "Bộ ba" : sideLabel(latest.resultTruyenThong),
     xuc_xac: Array.isArray(latest.dices) ? latest.dices : [],
     phien_du_doan: sessionOutput(prediction ? prediction.phien_du_doan : nextSessionOf(latest)),
     du_doan: prediction ? prediction.du_doan : null,
     do_tin_cay: prediction ? prediction.do_tin_cay : null,
     icon: prediction ? prediction.icon : "⏳"
   };
+}
+function historyPayload(gameId) {
+  const logs = predictionStore[gameId] || [];
+  return logs.slice(-FEED_LIMIT).map(predictionRecordForApi);
 }
 
 // ===== Lõi quyết định giữ theo byhaquoc.js (sửa duy nhất lỗi tham chiếu hh[i] vượt mảng) =====
@@ -353,6 +361,11 @@ function runsOf(history) {
  * Backtest walk-forward: tối ưu nửa đầu 61,5% -> kiểm chứng nửa sau 71,8%.
  * Toàn bộ: 78 lệnh, 66,7%, vốn +37, chuỗi thua max 3, drawdown max 4 đơn vị.
  */
+
+function clampConfidence(value) {
+  const n = Math.round(Number(value) || 50);
+  return Math.max(50, Math.min(100, n));
+}
 
 function analyzeAdaptiveHybridV6(history) {
   const n = history.length;
@@ -391,12 +404,13 @@ function analyzeAdaptiveHybridV6(history) {
   for (let i = 1; i < last10.length; i++) if (last10[i] !== last10[i - 1]) flips10++;
 
   const isTriple = dices[0] === dices[1] && dices[1] === dices[2];
+  const sessionSalt = Number(cur.session) % 7; // biến thiên nhẹ theo phiên, tránh % lặp cứng
 
   // ═══ LỚP 0: BÃO / CẦU XẤU -> ĐỨNG NGOÀI ═══
   if (isTriple) {
     return {
       pick: curRes,
-      confidence: 50,
+      confidence: clampConfidence(50 + sessionSalt),
       theCau: `Bão đồng chất ${dices.join("-")} (thị trường sốc)`,
       khuyenNghi: "QUAN SÁT - CHỜ NHỊP",
       shouldBet: false,
@@ -405,25 +419,18 @@ function analyzeAdaptiveHybridV6(history) {
   }
 
   // ═══ LỚP 1: CẦU BĂM (>=6/10 đảo chiều) -> THEO PHIÊN VỪA XỔ ═══
-  // Backtest: khi cầu băm đang chạy, theo tiếp phiên vừa xổ thắng 72,7%.
-  // v7.1 khóa lệnh ở đây là SAI: đây chính là thời điểm có lợi thế nhất.
   if (flips10 >= 6) {
     return {
       pick: curRes,
-      confidence: 65,
+      confidence: clampConfidence(58 + flips10 * 3 + (sessionSalt % 4)),
       theCau: `Cầu băm ${flips10}/10 đảo chiều -> theo nhịp`,
       khuyenNghi: "ĐẸP - NÊN VÀO",
       shouldBet: true,
-      reason: `Cầu băm đang chạy (${flips10}/10 đảo) -> tiếp diễn tốt trong backtest (8/11) -> THEO phiên vừa xổ`,
+      reason: `Cầu băm đang chạy (${flips10}/10 đảo) -> tiếp diễn tốt trong backtest -> THEO phiên vừa xổ`,
     };
   }
 
-  // ═══ LỚP 1.5: TỰ HỌC KHUÔN CẦU (1-1, 2-2, 1-2-1, 3-1-3, 1-2-3...) - CÓ CỔNG AN TOÀN ═══
-  // So khớp chữ ký 3 run cuối với TOÀN BỘ lịch sử archive đang có, đo xác suất
-  // tiếp/bẻ thực tế của từng khuôn. CHỈ ghi đè khi khuôn đã đủ dày (>=15 mẫu)
-  // và có edge rõ (>=65%). Mẫu mỏng thì KHÔNG hành động -> tránh học vẹt nhiễu
-  // (backtest đã chứng minh: dùng khuôn khi mẫu <10 làm tụt từ 66,7% xuống 53-60%).
-  // Lớp này tự động thông minh hơn khi sessionArchive dài thêm.
+  // ═══ LỚP 1.5: TỰ HỌC KHUÔN CẦU ═══
   if (n >= 60) {
     const sigMap = {};
     for (let i = 30; i < n; i++) {
@@ -435,57 +442,55 @@ function analyzeAdaptiveHybridV6(history) {
     const curSig = runs.slice(-3).map((r) => r.len).join(",");
     const s = sigMap[curSig];
     if (s && s.tiep + s.nguoc >= 15) {
-      const pTiep = s.tiep / (s.tiep + s.nguoc);
+      const total = s.tiep + s.nguoc;
+      const pTiep = s.tiep / total;
       if (pTiep >= 0.65) {
         return {
           pick: curRes,
-          confidence: Math.round(50 + 25 * pTiep),
-          theCau: `Khuôn ${curSig} tự học -> tiếp (${s.tiep}/${s.tiep + s.nguoc})`,
+          confidence: clampConfidence(55 + pTiep * 40 + Math.min(8, Math.floor(total / 20))),
+          theCau: `Khuôn ${curSig} tự học -> tiếp (${s.tiep}/${total})`,
           khuyenNghi: "ĐẸP - NÊN VÀO",
           shouldBet: true,
-          reason: `Khuôn ${curSig} trong archive: tiếp diễn ${s.tiep}/${s.tiep + s.nguoc} lần (>=65%) -> THEO`,
+          reason: `Khuôn ${curSig} trong archive: tiếp diễn ${s.tiep}/${total} lần (>=65%) -> THEO`,
         };
       }
       if (pTiep <= 0.35) {
         return {
           pick: oppRes,
-          confidence: Math.round(50 + 25 * (1 - pTiep)),
-          theCau: `Khuôn ${curSig} tự học -> bẻ (${s.nguoc}/${s.tiep + s.nguoc})`,
+          confidence: clampConfidence(55 + (1 - pTiep) * 40 + Math.min(8, Math.floor(total / 20))),
+          theCau: `Khuôn ${curSig} tự học -> bẻ (${s.nguoc}/${total})`,
           khuyenNghi: "ĐẸP - NÊN VÀO",
           shouldBet: true,
-          reason: `Khuôn ${curSig} trong archive: gãy ${s.nguoc}/${s.tiep + s.nguoc} lần (>=65%) -> BẺ`,
+          reason: `Khuôn ${curSig} trong archive: gãy ${s.nguoc}/${total} lần (>=65%) -> BẺ`,
         };
       }
     }
   }
 
   // ═══ LỚP 2: BỆT STREAK >= 4 -> BẺ ═══
-  // Dữ liệu thật: streak 2/3/4 đứt 61%/58%/60% - không có vùng "an toàn để theo".
-  // Từ streak 4 trở đi bẻ để đón gãy (và mean reversion cũng đang nghiêng về phía ngược).
   if (K >= 4) {
     return {
       pick: oppRes,
-      confidence: 63,
+      confidence: clampConfidence(58 + Math.min(K, 10) * 3 + (sessionSalt % 5)),
       theCau: `Bẻ bệt tay ${K + 1} (đứt ~60% dữ liệu thật)`,
       khuyenNghi: "ĐẸP - NÊN VÀO",
       shouldBet: true,
-      reason: `Streak ${K} -> xác suất đứt thật ~58-61% (bảng cũ v7.1 ghi sai) -> BẺ`,
+      reason: `Streak ${K} -> xác suất đứt thật ~58-61% -> BẺ`,
     };
   }
 
-  // ═══ LỚP 3: NỀN TẢNG MEAN REVERSION - ĐÁNH NGƯỢC ĐA SỐ 10 PHIÊN ═══
-  // Đơn giản nhưng mạnh nhất trong backtest khi đứng một mình (63,5%):
-  // thị trường ngắn hạn có xu hướng hồi quy về cân bằng.
+  // ═══ LỚP 3: MEAN REVERSION - ĐÁNH NGƯỢC ĐA SỐ 10 PHIÊN ═══
   const countTai = last10.filter((x) => x === "TAI").length;
+  const imbalance = Math.abs(countTai - 5);
   const mrPick = countTai >= 5 ? "XIU" : "TAI";
   const mrSide = countTai >= 5 ? "xỉu" : "tài";
   return {
     pick: mrPick,
-    confidence: 62,
+    confidence: clampConfidence(52 + imbalance * 6 + flips10 + (sessionSalt % 4)),
     theCau: `Hồi quy: ${countTai}/10 tài -> nghiêng ${mrSide}`,
     khuyenNghi: "ĐẸP - NÊN VÀO",
     shouldBet: true,
-    reason: `10 phiên gần nhất có ${countTai} tài / ${10 - countTai} xỉu -> đánh ngược đa số (mean reversion, 63,5% lẻ trong backtest)`,
+    reason: `10 phiên gần nhất có ${countTai} tài / ${10 - countTai} xỉu -> đánh ngược đa số (mean reversion)`,
   };
 }
 
@@ -504,7 +509,7 @@ async function fetchGame(gameId) {
     });
     if (!response.ok) throw new Error(`Nguồn trả HTTP ${response.status}`);
     const raw = await response.json();
-    const rows = getRows(raw).map(game.parser === "xocdia" ? parseXocdiaRow : parseTxRow).filter(row => row.session);
+    const rows = getRows(raw).map(parseTxRow).filter(row => row.session);
     if (!rows.length) throw new Error("API không trả danh sách phiên hợp lệ; có thể cấu trúc nguồn đã đổi");
     const merged = mergeRows(gameId, rows);
     gameStatus[gameId] = { ok: true, message: null, updated: new Date().toISOString(), samples: merged.length };
@@ -526,7 +531,7 @@ function createPrediction(gameId, rows) {
   const record = {
     id: API_ID,
     phien: latest.session,
-    ket_qua: latest.resultTruyenThong || (latest.isTriple ? "Bộ ba" : "Không rõ"),
+    ket_qua: latest.isTriple ? "Bộ ba" : sideLabel(latest.resultTruyenThong),
     xuc_xac: Array.isArray(latest.dices) ? latest.dices : [],
     phien_du_doan: target,
     du_doan: decision.pick === "TAI" ? "Tài" : decision.pick === "XIU" ? "Xỉu" : null,
@@ -543,8 +548,10 @@ function createPrediction(gameId, rows) {
     algorithm_version: ALGO_VERSION,
     created_at: new Date().toISOString()
   };
-  predictionStore[gameId].unshift(record);
-  if (predictionStore[gameId].length > FEED_LIMIT) predictionStore[gameId].length = FEED_LIMIT;
+  predictionStore[gameId].push(record);
+  if (predictionStore[gameId].length > FEED_LIMIT) {
+    predictionStore[gameId] = predictionStore[gameId].slice(-FEED_LIMIT);
+  }
   savePredictions(gameId);
   console.log(`[${gameId}] #${target}: ${record.du_doan || "CHỜ"} (${record.do_tin_cay}) · ${record.pattern}`);
   return record;
@@ -553,35 +560,19 @@ async function runGame(gameId) {
   if (busy.has(gameId)) return busy.get(gameId);
   const task = (async () => {
     const rows = await fetchGame(gameId);
-    if (GAMES[gameId].type === "xocdia") {
-      latestPayloads[gameId] = makeXocdiaPayload(gameId, rows);
-      return latestPayloads[gameId];
-    }
     settlePredictions(gameId, rows);
     const latest = rows[rows.length - 1];
     const prediction = createPrediction(gameId, rows);
     const payload = makeOutputPayload(gameId, latest, prediction);
     latestPayloads[gameId] = payload;
-    return payload;
+    // Trả về mảng lịch sử tối đa 50 phiên, bản mới nhất ở cuối
+    return historyPayload(gameId);
   })().catch(error => {
     gameStatus[gameId] = { ok: false, message: error.message, updated: new Date().toISOString(), samples: (sourceStore[gameId] || []).length };
     throw error;
   }).finally(() => busy.delete(gameId));
   busy.set(gameId, task);
   return task;
-}
-function makeXocdiaPayload(gameId, rows) {
-  const latest = rows[rows.length - 1] || {};
-  return {
-    id: API_ID,
-    phien: sessionOutput(latest.session),
-    ket_qua: latest.resultTruyenThong || "Không rõ",
-    xuc_xac: latest.dices || [],
-    phien_du_doan: null,
-    du_doan: null,
-    do_tin_cay: null,
-    icon: "ℹ️"
-  };
 }
 function getStats(gameId) {
   const logs = predictionStore[gameId] || [];
@@ -601,7 +592,8 @@ function buildOverview() {
   const games = Object.entries(GAMES).map(([gameId, game]) => {
     const status = gameStatus[gameId] || { ok: null, message: null, samples: (sourceStore[gameId] || []).length };
     const logs = predictionStore[gameId] || [];
-    const latest = latestPayloads[gameId] || (logs[0] ? predictionRecordForApi(logs[0]) : null);
+    const last = logs.length ? logs[logs.length - 1] : null;
+    const latest = latestPayloads[gameId] || (last ? predictionRecordForApi(last) : null);
     const stats = getStats(gameId);
     return {
       game: gameId,
@@ -613,7 +605,7 @@ function buildOverview() {
       samples: status.samples || 0,
       latest,
       stats,
-      recent: logs.slice(0, 8).map(predictionRecordForApi),
+      recent: logs.slice(-8).map(predictionRecordForApi),
       latest_result: (sourceStore[gameId] || []).slice(-1)[0] || null
     };
   });
