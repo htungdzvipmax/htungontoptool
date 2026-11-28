@@ -32,13 +32,14 @@ const MIN_HISTORY = 15;
 const ALGO_VERSION = "byhaquoc_v8.0_meanrev_adaptive_chop";
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
-// LC79 + MAX789 — chỉ Tài/Xỉu (3 xúc xắc). Không dùng Xóc Đĩa.
+// LC79 + MAX789 + Sunwin — chỉ Tài/Xỉu (3 xúc xắc).
 const GAMES = {
   "lc79/tx": { label: "LC79 · Tài Xỉu", brand: "LC79", type: "tx", parser: "tx", url: "https://wtx.tele68.com/v1/tx/lite-sessions?cp=R&cl=R&pf=web&at=" },
   "lc79/md5": { label: "LC79 · MD5", brand: "LC79", type: "tx", parser: "tx", url: "https://wtxmd52.tele68.com/v1/txmd5/sessions?cp=R&cl=R&pf=web&at=4d3971b6956a5309f02b8bf55c093399" },
   "max789/tx": { label: "MAX789 · Tài Xỉu", brand: "MAX789", type: "tx", parser: "max", url: "https://taixiu.maksh3979madfw.com/api/luckydice/GetSoiCau" },
   "max789/md5": { label: "MAX789 · MD5", brand: "MAX789", type: "tx", parser: "max", url: "https://taixiumd5.maksh3979madfw.com/api/md5luckydice/GetSoiCau" },
-  "max789/kubet": { label: "MAX789 · Kubet", brand: "MAX789", type: "tx", parser: "max", url: "https://txkubet.maksh3979madfw.com/api/taixiukubet/GetSoiCau" }
+  "max789/kubet": { label: "MAX789 · Kubet", brand: "MAX789", type: "tx", parser: "max", url: "https://txkubet.maksh3979madfw.com/api/taixiukubet/GetSoiCau" },
+  "sunwin/tx": { label: "SUNWIN · Tài Xỉu", brand: "SUNWIN", type: "tx", parser: "sunwin", url: "https://apiv3.vandatshop.site/api.php?id=sunwin&key=2" }
 };
 
 function sideLabel(code) {
@@ -104,7 +105,9 @@ function toNumber(value) {
   return Number.isFinite(number) ? number : null;
 }
 function getSession(row) {
-  const value = firstValue(row, ["session", "Session", "phien", "Phien", "sessionId", "SessionId", "gameNum", "GameNum", "id", "ID", "_id", "issue", "issueNo", "round", "roundId"]);
+  const value = firstValue(row, ["session", "Session", "phien", "Phien", "phien_truoc", "Phien_truoc", "sessionId", "SessionId", "gameNum", "GameNum", "id", "ID", "_id", "issue", "issueNo", "round", "roundId"]);
+  // Bỏ qua id dạng @username
+  if (value != null && String(value).startsWith("@")) return "";
   return value == null ? "" : String(value).replace(/^#/, "").trim();
 }
 function getRows(raw, depth = 0) {
@@ -134,6 +137,8 @@ function getDice(row) {
   if (typeof value === "string") value = value.split(/[\s,;|/-]+/).filter(Boolean);
   if (!Array.isArray(value)) {
     const groups = [
+      ["xuc_xac1", "xuc_xac2", "xuc_xac3"],
+      ["Xuc_xac1", "Xuc_xac2", "Xuc_xac3"],
       ["Xuc_xac_1", "Xuc_xac_2", "Xuc_xac_3"],
       ["xuc_xac_1", "xuc_xac_2", "xuc_xac_3"],
       ["FirstDice", "SecondDice", "ThirdDice"],
@@ -299,7 +304,7 @@ function settlePredictions(gameId, rows) {
 }
 function getCurrentRecord(gameId) {
   const logs = predictionStore[gameId] || [];
-  return logs.length ? logs[logs.length - 1] : null;
+  return logs.length ? logs[0] : null;
 }
 function predictionRecordForApi(record) {
   if (!record) return null;
@@ -328,8 +333,9 @@ function makeOutputPayload(gameId, latest, prediction) {
   };
 }
 function historyPayload(gameId) {
+  // Mới nhất ở đầu mảng, cũ dần xuống đáy (tối đa FEED_LIMIT)
   const logs = predictionStore[gameId] || [];
-  return logs.slice(-FEED_LIMIT).map(predictionRecordForApi);
+  return logs.slice(0, FEED_LIMIT).map(predictionRecordForApi);
 }
 
 // ===== Lõi quyết định giữ theo byhaquoc.js (sửa duy nhất lỗi tham chiếu hh[i] vượt mảng) =====
@@ -467,15 +473,69 @@ function analyzeAdaptiveHybridV6(history) {
     }
   }
 
-  // ═══ LỚP 2: BỆT STREAK >= 4 -> BẺ ═══
-  if (K >= 4) {
+  // ═══ LỚP 2: CẦU BỆT (STREAK) — THEO / BẺ theo độ dài + nhịp gần ═══
+  // Không còn "streak >= 4 là bẻ hết". Phân tầng:
+  //   K=2..3  : ưu tiên THEO (bệt ngắn còn momentum)
+  //   K=4..5  : cân bằng — theo nếu nhịp ổn, bẻ nếu đang chop nhẹ
+  //   K>=6    : ưu tiên BẺ (đứt muộn), vẫn theo nếu rất ít flip
+  if (K >= 2) {
+    const recent5 = history.slice(-5).map((x) => x.resultTruyenThong);
+    let flips5 = 0;
+    for (let i = 1; i < recent5.length; i++) if (recent5[i] !== recent5[i - 1]) flips5++;
+    const stable = flips5 <= 1;
+
+    if (K <= 3) {
+      // Bệt ngắn: theo tiếp
+      return {
+        pick: curRes,
+        confidence: clampConfidence(62 + K * 4 + (stable ? 6 : 0) + (sessionSalt % 5)),
+        theCau: `Theo bệt ${sideLabel(curRes).toLowerCase()} tay ${K} (momentum)`,
+        khuyenNghi: "ĐẸP - NÊN VÀO",
+        shouldBet: true,
+        reason: `Streak ${K} còn ngắn -> THEO bệt`,
+      };
+    }
+
+    if (K <= 5) {
+      // Bệt vừa: theo khi nhịp ổn định, bẻ khi đang lắc
+      if (stable || flips10 <= 3) {
+        return {
+          pick: curRes,
+          confidence: clampConfidence(60 + K * 3 + (sessionSalt % 4)),
+          theCau: `Theo bệt ${sideLabel(curRes).toLowerCase()} tay ${K} (nhịp ổn)`,
+          khuyenNghi: "ĐẸP - NÊN VÀO",
+          shouldBet: true,
+          reason: `Streak ${K}, ít đảo chiều -> THEO bệt`,
+        };
+      }
+      return {
+        pick: oppRes,
+        confidence: clampConfidence(58 + K * 2 + flips10 + (sessionSalt % 5)),
+        theCau: `Bẻ bệt tay ${K} (nhịp lắc)`,
+        khuyenNghi: "ĐẸP - NÊN VÀO",
+        shouldBet: true,
+        reason: `Streak ${K} nhưng gần đây đảo nhiều -> BẺ`,
+      };
+    }
+
+    // K >= 6: ưu tiên bẻ, trừ khi cực kỳ ổn định
+    if (stable && flips10 <= 2) {
+      return {
+        pick: curRes,
+        confidence: clampConfidence(55 + Math.min(K, 12) + (sessionSalt % 4)),
+        theCau: `Theo bệt dài ${sideLabel(curRes).toLowerCase()} tay ${K} (cực ổn)`,
+        khuyenNghi: "THẬN TRỌNG",
+        shouldBet: true,
+        reason: `Streak ${K} rất ổn định -> vẫn THEO`,
+      };
+    }
     return {
       pick: oppRes,
-      confidence: clampConfidence(58 + Math.min(K, 10) * 3 + (sessionSalt % 5)),
-      theCau: `Bẻ bệt tay ${K + 1} (đứt ~60% dữ liệu thật)`,
+      confidence: clampConfidence(62 + Math.min(K, 10) * 2 + (sessionSalt % 5)),
+      theCau: `Bẻ bệt dài tay ${K}`,
       khuyenNghi: "ĐẸP - NÊN VÀO",
       shouldBet: true,
-      reason: `Streak ${K} -> xác suất đứt thật ~58-61% -> BẺ`,
+      reason: `Streak ${K} dài -> BẺ đón gãy`,
     };
   }
 
@@ -494,6 +554,35 @@ function analyzeAdaptiveHybridV6(history) {
   };
 }
 
+function parseSunwinPatternRows(raw) {
+  // Chỉ lấy phiên + kết quả + xúc xắc từ nguồn; KHÔNG dùng du_doan của họ.
+  // pattern dạng "txxxtxt..." dùng để bootstrap lịch sử khi store còn mỏng.
+  const latest = parseTxRow(raw);
+  if (!latest.session) return [];
+  const rows = [];
+  const pattern = String(raw.pattern || "").toLowerCase().replace(/[^tx]/g, "");
+  if (pattern.length >= MIN_HISTORY) {
+    const base = Number(latest.session);
+    // pattern[0] là phiên cũ nhất trong chuỗi
+    for (let i = 0; i < pattern.length - 1; i++) {
+      const ch = pattern[i];
+      if (ch !== "t" && ch !== "x") continue;
+      const session = String(base - (pattern.length - 1 - i));
+      rows.push({
+        session,
+        dices: [],
+        sum: null,
+        resultTruyenThong: ch === "t" ? "TAI" : "XIU",
+        isTriple: false,
+        time: null,
+        nextSession: null
+      });
+    }
+  }
+  rows.push(latest);
+  return rows;
+}
+
 async function fetchGame(gameId) {
   const game = GAMES[gameId];
   const controller = new AbortController();
@@ -509,7 +598,12 @@ async function fetchGame(gameId) {
     });
     if (!response.ok) throw new Error(`Nguồn trả HTTP ${response.status}`);
     const raw = await response.json();
-    const rows = getRows(raw).map(parseTxRow).filter(row => row.session);
+    let rows;
+    if (game.parser === "sunwin") {
+      rows = parseSunwinPatternRows(raw).filter(row => row.session);
+    } else {
+      rows = getRows(raw).map(parseTxRow).filter(row => row.session);
+    }
     if (!rows.length) throw new Error("API không trả danh sách phiên hợp lệ; có thể cấu trúc nguồn đã đổi");
     const merged = mergeRows(gameId, rows);
     gameStatus[gameId] = { ok: true, message: null, updated: new Date().toISOString(), samples: merged.length };
@@ -548,9 +642,10 @@ function createPrediction(gameId, rows) {
     algorithm_version: ALGO_VERSION,
     created_at: new Date().toISOString()
   };
-  predictionStore[gameId].push(record);
+  // Đẩy dự đoán mới lên đầu; bản cũ xuống đáy, giữ tối đa FEED_LIMIT
+  predictionStore[gameId].unshift(record);
   if (predictionStore[gameId].length > FEED_LIMIT) {
-    predictionStore[gameId] = predictionStore[gameId].slice(-FEED_LIMIT);
+    predictionStore[gameId] = predictionStore[gameId].slice(0, FEED_LIMIT);
   }
   savePredictions(gameId);
   console.log(`[${gameId}] #${target}: ${record.du_doan || "CHỜ"} (${record.do_tin_cay}) · ${record.pattern}`);
@@ -592,7 +687,7 @@ function buildOverview() {
   const games = Object.entries(GAMES).map(([gameId, game]) => {
     const status = gameStatus[gameId] || { ok: null, message: null, samples: (sourceStore[gameId] || []).length };
     const logs = predictionStore[gameId] || [];
-    const last = logs.length ? logs[logs.length - 1] : null;
+    const last = logs.length ? logs[0] : null;
     const latest = latestPayloads[gameId] || (last ? predictionRecordForApi(last) : null);
     const stats = getStats(gameId);
     return {
@@ -605,7 +700,7 @@ function buildOverview() {
       samples: status.samples || 0,
       latest,
       stats,
-      recent: logs.slice(-8).map(predictionRecordForApi),
+      recent: logs.slice(0, 8).map(predictionRecordForApi),
       latest_result: (sourceStore[gameId] || []).slice(-1)[0] || null
     };
   });
